@@ -6,6 +6,7 @@ import java.awt.event.ActionListener;
 
 import javax.swing.JButton;
 import javax.swing.JFrame;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
@@ -15,6 +16,7 @@ public class GuessNumber extends JFrame implements ActionListener{
 	private JTextField input;
 	private JTextArea log;
 	private String answer;
+	private int counter;
 	
 	public GuessNumber() {
 		super("猜數字遊戲");
@@ -68,8 +70,11 @@ public class GuessNumber extends JFrame implements ActionListener{
 	}
 	
 	private void initGame() {
+		counter = 0;
 		answer = createAnswer(3);
-		//System.out.println(answer);
+		log.setText("");
+		input.setText("");
+		System.out.println(answer);
 	}
 	
 	public static void main(String[] args) {
@@ -78,10 +83,20 @@ public class GuessNumber extends JFrame implements ActionListener{
 
 	@Override
 	public void actionPerformed(ActionEvent e) {
+		counter++;
 		String g = input.getText();
 		String result = checkAB(g);
-		log.append(String.format("%s => %s\n", g, result));
+		log.append(String.format("%d. %s => %s\n", counter, g, result));
 		input.setText("");
+		
+		if (result.equals("3A0B")) {
+			JOptionPane.showMessageDialog(null, "恭喜老爺");
+			initGame();
+		}else if (counter == 3) {
+			JOptionPane.showMessageDialog(null, "魯蛇: 謎底:" + answer);
+			initGame();
+		}
+		
 	}
 	
 	private String checkAB(String g) {
