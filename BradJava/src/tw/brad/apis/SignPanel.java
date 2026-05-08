@@ -12,7 +12,8 @@ import java.util.List;
 import javax.swing.JPanel;
 
 public class SignPanel extends JPanel{
-	private List<Line> lines;
+	private List<Line> lines, recycle;
+	private Color nowColor;
 	
 	public SignPanel() {
 		setBackground(Color.YELLOW);
@@ -21,6 +22,9 @@ public class SignPanel extends JPanel{
 		addMouseMotionListener(listener);
 		
 		lines = new LinkedList<>();
+		recycle = new LinkedList<>();
+		
+		nowColor = Color.BLACK;
 	}
 	
 	@Override
@@ -29,9 +33,9 @@ public class SignPanel extends JPanel{
 		
 		Graphics2D g2d = (Graphics2D)g;
 		g2d.setStroke(new BasicStroke(4));
-		g2d.setColor(Color.RED);
 		
 		for (Line line: lines) {
+			g2d.setColor(line.getColor());
 			for (int i=1; i<line.getSize(); i++) {
 				g2d.drawLine(line.getX(i-1), line.getY(i-1),
 						line.getX(i), line.getY(i));
@@ -44,7 +48,9 @@ public class SignPanel extends JPanel{
 	private class MyMouseListener extends MouseAdapter{
 		@Override
 		public void mousePressed(MouseEvent e) {
-			Line line = new Line();
+			recycle.clear();
+			
+			Line line = new Line(nowColor);
 			line.addXY(e.getX(), e.getY());
 			lines.add(line);
 		}
@@ -55,6 +61,29 @@ public class SignPanel extends JPanel{
 			repaint();
 		}
 	}
+	
+	public void clear() {
+		lines.clear();
+		repaint();
+	}
+	
+	public void undo() {
+		if (lines.size() > 0) {
+			recycle.add(lines.removeLast()) ;
+			repaint();
+		}
+	}
+	
+	public void redo() {
+		if (recycle.size() > 0) {
+			lines.add(recycle.removeLast());
+			repaint();
+		}
+		
+	}
+	
+	public Color getColor() {return nowColor;}
+	public void changeColor(Color newColor) {nowColor = newColor;}
 	
 }
 

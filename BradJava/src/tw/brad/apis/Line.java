@@ -6,11 +6,12 @@ import java.util.List;
 
 public class Line {
 	private List<Point> points;
-	private Color coloe;
+	private Color color;
 	private float width;
 	
-	public Line() {
+	public Line(Color color) {
 		points = new LinkedList<>();
+		this.color = color;
 	}
 	
 	public void addXY(int x, int y) {
@@ -26,5 +27,12 @@ public class Line {
 	public int getY(int index) {
 		return points.get(index).getY();
 	}
+
+	public Color getColor() {
+		return color;
+	}
+
+
+	
 	
 }
