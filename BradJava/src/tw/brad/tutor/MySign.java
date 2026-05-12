@@ -18,7 +18,7 @@ import tw.brad.apis.SignPanel;
 
 public class MySign extends JFrame{
 	private SignPanel panel;
-	private JButton clear, undo, redo, color, saveObj, saveAsObj, loadObj;
+	private JButton clear, undo, redo, color, saveObj, saveAsObj, loadObj, saveJPEG;
 	private File nowFile;
 	
 	public MySign() {
@@ -37,9 +37,11 @@ public class MySign extends JFrame{
 		saveObj = new JButton("Save Obj");
 		saveAsObj = new JButton("SaveAs Obj");
 		loadObj = new JButton("Load Obj");
+		saveJPEG = new JButton("Save JPEG");
 		top.add(clear);top.add(undo);top.add(redo);
 		top.add(color);
 		top.add(saveObj);top.add(saveAsObj);top.add(loadObj);
+		top.add(saveJPEG);
 		
 		add(top, BorderLayout.NORTH);
 		
@@ -93,6 +95,12 @@ public class MySign extends JFrame{
 				loadObj();
 			}
 		});
+		saveJPEG.addActionListener(new ActionListener() {
+			@Override
+			public void actionPerformed(ActionEvent e) {
+				saveJPEG();
+			}
+		});
 	}
 	
 	private void changeColor() {
@@ -140,6 +148,18 @@ public class MySign extends JFrame{
 		}
 	}
 	
+	private void saveJPEG() {
+		JFileChooser jfc = new JFileChooser();
+		if (jfc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+			File saveFile = jfc.getSelectedFile();
+			try {
+				panel.saveJPEG(saveFile);
+				JOptionPane.showMessageDialog(this, "Save Success");
+			} catch (Exception e) {
+				JOptionPane.showMessageDialog(this, "Save Failure");
+			}
+		}
+	}	
 
 	public static void main(String[] args) {
 		new MySign();

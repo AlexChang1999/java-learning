@@ -6,6 +6,7 @@ import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -14,6 +15,7 @@ import java.io.ObjectOutputStream;
 import java.util.LinkedList;
 import java.util.List;
 
+import javax.imageio.ImageIO;
 import javax.swing.JPanel;
 
 public class SignPanel extends JPanel{
@@ -103,6 +105,16 @@ public class SignPanel extends JPanel{
 			lines = (List<Line>)oin.readObject();
 			repaint();
 		}
+	}
+	
+	public void saveJPEG(File saveFile) throws Exception {
+		BufferedImage img = 
+			new BufferedImage(getWidth(), getHeight(), BufferedImage.TYPE_INT_RGB);
+		Graphics2D g2d = img.createGraphics();
+		paint(g2d);
+		g2d.dispose();
+		
+		ImageIO.write(img, "jpg", saveFile);
 	}
 	
 }
