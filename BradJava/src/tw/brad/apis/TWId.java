@@ -32,17 +32,25 @@ public class TWId extends Object{
 		
 	}
 	
-	private TWId(String id) {
-		this.id = id;
-	}
-	
-	public static TWId createTWId(String id) {
+	public TWId(String id) throws Exception {
 		if (isRight(id)) {
-			return new TWId(id);
+			this.id = id;
 		}else {
-			return null;
+			throw new Exception();
 		}
 	}
+	
+//	private TWId(String id) {
+//		this.id = id;
+//	}
+	
+//	public static TWId createTWId(String id) {
+//		if (isRight(id)) {
+//			return new TWId(id);
+//		}else {
+//			return null;
+//		}
+//	}
 	
 	@Override
 	public String toString() {
