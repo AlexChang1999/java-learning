@@ -256,6 +256,169 @@ java -XX:+PrintAssembly -XX:+UnlockDiagnosticVMOptions MyApp
 
 ---
 
+## 七、逃逸分析的實際影響：對撮合引擎意味著什麼？
+
+### 逃逸分析的三種結果
+
+```
+JIT 看完一個物件的生命週期後，有三種判斷：
+
+1. 不逃逸（No Escape）
+   → 物件只在方法內使用，不傳給任何外部
+   → JIT 可以：把物件欄位拆散放進 CPU 暫存器（Scalar Replacement）
+   → 甚至完全不分配記憶體！
+   → GC 壓力：零
+
+2. 僅在方法的執行緒內使用（Thread-Local Escape）
+   → 不需要同步機制（lock 消除）
+   → 可以分配在 Stack
+   → GC 壓力：低
+
+3. 全域逃逸（Global Escape）
+   → 物件被傳出去、被 static 欄位持有、或跨執行緒共享
+   → 必須分配在 Heap
+   → GC 壓力：正常
+```
+
+### 具體程式碼對比
+
+```java
+// ❌ 情境一：物件逃逸 → 必須放 Heap → GC 管理
+public class OrderFactory {
+    public Order createOrder(String symbol, double price) {
+        return new Order(symbol, price);  // 物件被 return 出去 → 逃逸！
+        // JIT 無法優化，只能在 Heap 分配，等 GC 回收
+    }
+}
+
+// ✅ 情境二：物件不逃逸 → JIT 可能完全消除 Heap 分配
+public class PriceCalculator {
+    public double calcMidPrice(double bid, double ask) {
+        // Point 只在這個方法內用，沒有傳出去
+        Point midPoint = new Point(bid, ask);  // JIT 看出不逃逸！
+        return (midPoint.x + midPoint.y) / 2.0;
+        // JIT 優化後等同於：return (bid + ask) / 2.0;
+        // Point 物件根本不會被建立，直接用暫存器計算
+    }
+}
+```
+
+### 撮合引擎的逃逸分析應用
+
+```java
+// 撮合過程中的中間計算物件——JIT 可以優化掉
+public class MatchingEngine {
+    public void match(Order buyOrder, Order sellOrder) {
+        // TradeResult 只在這個方法內計算，然後立刻記錄
+        // 如果 JIT 確認它不逃逸（例如只傳給私有方法），可以 Stack 分配
+        TradeResult result = new TradeResult(
+            Math.min(buyOrder.qty, sellOrder.qty),
+            sellOrder.price  // 以賣方報價成交
+        );
+        logTrade(result);   // 如果 logTrade 被內聯，result 可能完全消失
+    }
+}
+
+// 撮合引擎暖機的意義：
+// - 第一批訂單（1~2000次）：解譯器跑，逃逸分析還沒開始，全部 Heap 分配
+// - 2000~15000次：C1 編譯，基本逃逸分析，部分 Stack 分配
+// - 15000次後：C2 深度優化，充分逃逸分析，GC 壓力降到最低
+// → 這就是為什麼撮合引擎開市前要「預熱」：先丟假訂單讓 JIT 跑滿 C2
+```
+
+### 如何確認逃逸分析是否有效
+
+```bash
+# 開啟逃逸分析日誌（需要 debug 版 JVM）
+java -XX:+DoEscapeAnalysis \
+     -XX:+PrintEscapeAnalysis \
+     -XX:+EliminateAllocations \   # 啟用 Scalar Replacement
+     -XX:+PrintEliminateAllocations \
+     MyApp
+
+# 用 JMH 測試有無逃逸分析的差距
+# （第十四章有完整的 JMH 用法）
+```
+
+---
+
+## 八、撮合引擎的 JIT 暖機策略
+
+### 為什麼第一批訂單特別慢？
+
+```
+時間軸（撮合引擎啟動）：
+
+0ms      ├── JVM 啟動，所有方法由解譯器執行
+         │   匹配延遲：~500μs（解譯器）
+         │
+500ms    ├── 熱點方法開始 C1 編譯（執行次數超過 2,000）
+         │   匹配延遲：~50μs（C1 優化）
+         │
+2000ms   ├── C2 深度優化完成（執行次數超過 15,000）
+         │   匹配延遲：~5μs（C2 最優化）
+         │
+         └── 系統穩定在最高效能
+
+C2 優化後比解譯器快 100 倍！
+這就是撮合引擎必須「暖機」的根本原因。
+```
+
+### 生產環境的暖機方式
+
+```java
+// 方式一：開市前跑假訂單（最常見）
+public class MatchingEngineWarmer {
+
+    private final MatchingEngine engine;
+
+    public void warmUp(int iterations) {
+        System.out.println("開始 JIT 暖機，跑 " + iterations + " 筆假訂單...");
+        long start = System.nanoTime();
+
+        for (int i = 0; i < iterations; i++) {
+            // 建立有代表性的假訂單（要覆蓋真實場景的程式碼路徑）
+            Order fakeBuy  = Order.limit("WARM", Side.BUY,  350.00, 100);
+            Order fakeSell = Order.limit("WARM", Side.SELL, 350.00, 100);
+
+            engine.submit(fakeBuy);
+            engine.submit(fakeSell);  // 這次撮合觸發所有關鍵路徑
+        }
+
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("暖機完成，耗時 " + elapsed + "ms，JIT 已達 C2 優化");
+        // 通常 15,000 次足夠觸發 C2，約需 1~5 秒
+    }
+}
+
+// 方式二：使用 -Xcomp（強制預先編譯，但啟動時間很長，不推薦）
+// java -Xcomp MyApp
+
+// 方式三：GraalVM AOT（提前編譯成機器碼，連暖機都省了）
+// → 適合無狀態微服務，但失去 JIT 的自適應優化能力
+```
+
+### 各種 JVM 執行模式的延遲對比
+
+```
+（撮合單筆限價單的延遲，僅供參考）
+
+解譯器模式（啟動初期）：   ~500  μs
+C1 編譯後：               ~ 50  μs
+C2 完整優化後：            ~  5  μs
+C++ 撮合引擎（HFT）：      ~  1  μs
+
+硬體參考：
+  L1 Cache 讀取：   ~1   ns（比 C2 Java 快 5000 倍）
+  RAM 讀取：      ~100   ns
+  Context Switch：~5000  ns（~5 μs）
+
+→ C2 優化後的 Java 延遲 (~5μs) 與一次 Context Switch 相當
+→ 這就是為什麼撮合引擎要盡量避免鎖競爭（鎖競爭 → Context Switch → +5μs）
+```
+
+---
+
 ## 本章練習題
 
 **Q1：為什麼 Java 程式剛啟動時效能較低，跑一段時間才穩定？用 JIT 機制解釋。**
