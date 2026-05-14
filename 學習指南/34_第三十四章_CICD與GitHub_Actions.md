@@ -761,6 +761,425 @@ jobs:
 
 ---
 
+---
+
+## 七、Self-Hosted Runner — 自架執行器 <!-- 💡 進階 -->
+
+### 為什麼需要 Self-Hosted Runner？
+
+```
+GitHub-hosted Runner（預設）：
+  優點：零維護，每次執行都是乾淨環境
+  缺點：
+    - 沒有網路存取企業內部資源（內網 DB、私有 Registry）
+    - 計算資源有限（2 CPU、7GB RAM）
+    - 每分鐘計費（大量 CI 成本高）
+    - 沒有持久化快取（每次 mvn download 重下）
+
+Self-Hosted Runner：
+  優點：完整控制環境、可存取內網、免費（硬體自備）
+  缺點：自己維護、有安全隱患（要控管誰能觸發）
+```
+
+### 設定 Self-Hosted Runner
+
+```bash
+# 在你的伺服器上執行（GitHub → Settings → Actions → Runners → New self-hosted runner）
+mkdir actions-runner && cd actions-runner
+
+# 1. 下載 Runner 套件
+curl -o actions-runner-linux-x64-2.315.0.tar.gz \
+  -L https://github.com/actions/runner/releases/download/v2.315.0/actions-runner-linux-x64-2.315.0.tar.gz
+
+tar xzf ./actions-runner-linux-x64-2.315.0.tar.gz
+
+# 2. 設定（會要求輸入 GitHub 給你的 Token）
+./config.sh --url https://github.com/your-org/java-learning --token YOUR_TOKEN
+
+# 3. 啟動（建議用 systemd 管理，確保重啟後自動啟動）
+./run.sh
+```
+
+```yaml
+# 在 Workflow 中指定使用 self-hosted runner
+jobs:
+  build:
+    runs-on: self-hosted          # 指定 self-hosted
+    # runs-on: [self-hosted, linux, x64]  # 可以加 label 篩選特定機器
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: mvn package -DskipTests
+        # 這台機器有 Maven Cache、可存取內網 DB、計算資源足夠
+```
+
+### Self-Hosted Runner 安全隱患
+
+```
+⚠️ 重要警告：公開的 Open-source Repo 不應該設 Self-Hosted Runner！
+  任何人都可以發 PR → 觸發 CI → 在你的機器上執行惡意程式碼
+
+安全原則：
+  1. 只對私有 Repo 開放 Self-Hosted Runner
+  2. 用容器模式執行（每次 Job 用新的容器，隔離環境）
+  3. 限制 Runner 的網路存取（只開放必要的 port）
+  4. 定期更新 Runner 套件
+```
+
+---
+
+## 八、Blue-Green 部署與金絲雀部署 <!-- 🔴 資深 -->
+
+### 什麼是 Zero-Downtime 部署？
+
+```
+傳統部署（有停機）：
+  停掉舊版本 → 部署新版本 → 啟動
+  ↑ 這段時間用戶看到 503 Error
+
+Blue-Green 部署（零停機）：
+  同時維護「藍色環境」和「綠色環境」
+  
+  目前線上：Blue（v1.0）接收 100% 流量
+  
+  ↓ 部署新版本到 Green（v1.1），Blue 仍在服務
+  
+  ↓ 流量切換：Load Balancer 將 100% 流量導向 Green（v1.1）
+               切換耗時 < 1 秒（修改 DNS 或 LB 設定）
+  
+  ↓ 若 v1.1 有問題，立刻切回 Blue（v1.0）← 秒級回滾
+  
+  ↓ v1.1 確認穩定後，Green 變成下次的「備用環境」
+```
+
+### GitHub Actions 實作 Blue-Green（搭配 AWS / Kubernetes）
+
+```yaml
+# .github/workflows/blue-green-deploy.yml
+name: Blue-Green Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and Push Image
+        run: |
+          docker build -t matching-engine:${{ github.sha }} .
+          docker push ${{ secrets.REGISTRY }}/matching-engine:${{ github.sha }}
+
+      # 部署到 Green 環境（非線上）
+      - name: Deploy to Green
+        run: |
+          kubectl set image deployment/matching-engine-green \
+            matching-engine=${{ secrets.REGISTRY }}/matching-engine:${{ github.sha }}
+          # 等待 Green 環境所有 Pod 就緒
+          kubectl rollout status deployment/matching-engine-green --timeout=300s
+
+      # 健康檢查 Green 環境
+      - name: Health Check Green
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://green.matching-engine.internal/actuator/health)
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Green health check failed!"
+            exit 1
+          fi
+
+      # 確認後切換流量（修改 Kubernetes Service 的 selector）
+      - name: Switch Traffic to Green
+        run: |
+          kubectl patch service matching-engine \
+            -p '{"spec":{"selector":{"slot":"green"}}}'
+          echo "✅ Traffic switched to Green (v${{ github.sha }})"
+
+      # 切換後繼續監控 5 分鐘（期間若發現問題可手動回滾）
+      - name: Monitor Deployment
+        run: |
+          sleep 300
+          ERROR_RATE=$(curl -s https://monitoring.internal/api/error-rate)
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "Error rate too high, rolling back!"
+            kubectl patch service matching-engine \
+              -p '{"spec":{"selector":{"slot":"blue"}}}'
+            exit 1
+          fi
+```
+
+### 金絲雀部署（Canary Release）
+
+```
+金絲雀部署：先把 5% 的流量導向新版本，觀察是否穩定，再逐步增加
+
+Load Balancer 流量分配：
+  v1.0（舊版本）：95%
+  v1.1（新版本）：5%  ← 金絲雀
+
+  觀察 1 小時後 → 無異常 → 調整為 50%/50%
+  觀察 1 小時後 → 無異常 → 調整為 0%/100%
+  若有異常 → 立刻回到 100% v1.0
+
+類比：礦工帶金絲雀進礦坑，金絲雀死了就撤離
+      新版本先承受少量真實流量，有問題影響最小
+```
+
+---
+
+## 九、Semantic Versioning 與 Release 自動化 <!-- 💡 進階 -->
+
+### 語意化版本號（SemVer）
+
+```
+格式：MAJOR.MINOR.PATCH
+例如：1.4.2
+
+MAJOR（主版本）：有不向後相容的 API 變更
+  1.0.0 → 2.0.0：重大改版，使用者需要修改程式碼
+
+MINOR（次版本）：新增功能，向後相容
+  1.4.0 → 1.5.0：新增了功能，但舊的用法仍然可用
+
+PATCH（修補版本）：Bug 修復
+  1.4.1 → 1.4.2：修了一個 bug，沒有新功能
+
+Pre-release：
+  1.5.0-alpha.1   開發中，可能有 bug
+  1.5.0-beta.2    功能完整，在測試中
+  1.5.0-rc.1      Release Candidate，準備正式發布
+```
+
+### GitHub Actions 自動打 Tag 與 Release
+
+```yaml
+# .github/workflows/release.yml
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'          # 當 push 的 tag 符合 v1.2.3 格式時觸發
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 抓完整歷史（生成 changelog 需要）
+
+      - name: Build
+        run: mvn package -DskipTests
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          # 從上一個 tag 到現在的 commit 自動生成 changelog
+          PREV_TAG=$(git describe --abbrev=0 --tags HEAD~1 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}         # 例如 v1.4.2
+          release_name: Release ${{ github.ref_name }}
+          body: |
+            ## 本次更新
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ## 安裝方式
+            ```bash
+            docker pull ghcr.io/your-org/matching-engine:${{ github.ref_name }}
+            ```
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}  # v1.5.0-beta.1 → prerelease
+
+      - name: Upload JAR to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/matching-engine.jar
+          asset_name: matching-engine-${{ github.ref_name }}.jar
+          asset_content_type: application/java-archive
+```
+
+```bash
+# 如何打 Tag 並觸發 Release
+git tag -a v1.4.2 -m "修復訂單撮合精度問題"
+git push origin v1.4.2
+# → GitHub Actions 自動建立 Release，附上 changelog 和 JAR 下載
+```
+
+---
+
+## 十、安全掃描整合 SAST/SCA <!-- 🔴 資深 -->
+
+### 三類安全掃描
+
+```
+SAST（Static Application Security Testing，靜態分析）：
+  分析原始碼，找出潛在漏洞（SQL Injection、XSS、硬編碼密碼...）
+  不需要執行程式
+  工具：SpotBugs + FindSecBugs、Semgrep
+
+SCA（Software Composition Analysis，第三方依賴掃描）：
+  掃描 pom.xml 中的依賴，比對已知 CVE 漏洞資料庫
+  例如：你用的 Log4j 2.14.1 有 Log4Shell 漏洞（CVE-2021-44228）
+  工具：OWASP Dependency Check、Snyk、GitHub Dependabot
+
+Secret Scanning：
+  掃描程式碼中是否有不小心 commit 的密碼、API Key
+  工具：git-secrets、TruffleHog、GitHub 內建
+```
+
+### 在 CI 中加入安全掃描
+
+```yaml
+# .github/workflows/security.yml
+name: Security Scan
+
+on: [push, pull_request]
+
+jobs:
+  # 1. 靜態程式碼分析（SpotBugs + FindSecBugs）
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '21', distribution: 'temurin' }
+      - name: Run SpotBugs
+        run: mvn spotbugs:check -Pfindsecbugs
+        # 若找到安全漏洞，mvn 回傳非 0，CI 失敗
+
+  # 2. 第三方依賴漏洞掃描
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'matching-engine'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --failOnCVSS 7          # CVSS 分數 ≥ 7（High/Critical）就讓 CI 失敗
+            --enableRetired         # 也掃描已退役的依賴
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dependency Check Report
+          path: reports/
+
+  # 3. Secret 掃描（確保沒有密碼被 commit）
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 掃描所有歷史
+      - name: TruffleHog Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main       # 和 main branch 比較
+          head: HEAD
+          extra_args: --only-verified
+```
+
+### pom.xml 加入 SpotBugs 設定
+
+```xml
+<!-- pom.xml 中加入 plugin -->
+<plugin>
+    <groupId>com.github.spotbugs</groupId>
+    <artifactId>spotbugs-maven-plugin</artifactId>
+    <version>4.8.3.1</version>
+    <configuration>
+        <!-- 加入 FindSecBugs 安全規則 -->
+        <plugins>
+            <plugin>
+                <groupId>com.h3xstream.findsecbugs</groupId>
+                <artifactId>findsecbugs-plugin</artifactId>
+                <version>1.12.0</version>
+            </plugin>
+        </plugins>
+        <threshold>Medium</threshold>   <!-- Medium 及以上的問題才報警 -->
+        <effort>Max</effort>            <!-- 最大掃描力度 -->
+    </configuration>
+</plugin>
+```
+
+---
+
+## 十一、CI/CD 效能優化速查 <!-- 💡 進階 -->
+
+### Pipeline 耗時分析
+
+```
+典型 Java Spring Boot CI 時間分佈：
+  checkout           : ~5s
+  setup-java         : ~30s（第一次）/ ~2s（有快取）
+  mvn dependency     : ~120s（第一次）/ ~10s（有快取）  ← 最大優化點
+  mvn compile        : ~30s
+  mvn test           : ~60s                              ← 可並行
+  docker build       : ~60s（第一次）/ ~10s（有 layer 快取）
+  docker push        : ~30s
+
+總計首次：~5分鐘
+有快取後：~2分鐘
+並行測試後：~1.5分鐘
+```
+
+### 優化策略
+
+```yaml
+# 策略 1：Maven 依賴快取（最重要）
+- uses: actions/cache@v4
+  with:
+    path: ~/.m2/repository
+    key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+    restore-keys: ${{ runner.os }}-maven-
+
+# 策略 2：並行執行單元測試（Maven Surefire fork）
+# pom.xml 中：
+# <configuration>
+#   <forkCount>2</forkCount>   使用 2 個 JVM 並行跑測試
+#   <reuseForks>true</reuseForks>
+# </configuration>
+
+# 策略 3：只在必要時跑完整測試
+on:
+  push:
+    branches: [main]        # push to main → 完整測試
+    paths:
+      - 'src/**'            # 只有 src 改動才觸發
+  pull_request:
+    branches: [main]
+
+# 策略 4：Test Report 快速失敗（第一個測試失敗就停止，不等後面跑完）
+- name: Test
+  run: mvn test --fail-at-end=false  # 預設 false，改為 true 可快速反饋
+```
+
+---
+
 ## 本章總結
 
 | 主題 | 重點 |

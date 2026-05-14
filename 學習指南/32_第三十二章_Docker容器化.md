@@ -750,6 +750,388 @@ JVM 容器化要點
 
 ---
 
+## 六、Container 網路深度解析 <!-- 💡 進階 -->
+
+### Linux 網路命名空間（Network Namespace）
+
+Docker 容器之所以能有「獨立 IP」，根本原因是 Linux Kernel 的 **Network Namespace**：
+
+```
+Host OS
+├── 主網路 Namespace（eth0: 192.168.1.100）
+│
+├── Container A 的 Namespace（eth0: 172.17.0.2）
+│     └── 實際上是一個 veth 介面對，一端在容器內，一端在 docker0 bridge
+│
+└── Container B 的 Namespace（eth0: 172.17.0.3）
+      └── 同上
+
+docker0 bridge（Host 上的虛擬交換機）
+  ├── veth-a ↔ Container A 的 eth0
+  └── veth-b ↔ Container B 的 eth0
+
+封包流向（A → B）：
+  Container A eth0 → veth-a → docker0 bridge → veth-b → Container B eth0
+  延遲：比 Host 直通多一次 bridge 轉發，約 +0.01~0.1ms（通常可忽略）
+```
+
+### 四種 Docker 網路模式
+
+```
+docker run --network <模式>
+
+┌────────────────┬──────────────────────────────────────────────────┐
+│ bridge（預設） │ 容器有獨立 IP（172.17.x.x），透過 docker0 通訊   │
+│                │ 適合：多容器互通，且需要隔離                     │
+├────────────────┼──────────────────────────────────────────────────┤
+│ host           │ 容器直接用 Host 的網路介面，無 NAT 開銷           │
+│                │ 適合：需要最低延遲的場景（例如撮合引擎本體）      │
+│                │ 缺點：port 直接暴露，隔離性差                    │
+├────────────────┼──────────────────────────────────────────────────┤
+│ none           │ 完全隔離，沒有網路                                │
+│                │ 適合：不需要網路的批次處理容器                    │
+├────────────────┼──────────────────────────────────────────────────┤
+│ overlay        │ 跨多台 Host 的虛擬網路（Kubernetes/Swarm 使用）  │
+│                │ 適合：分散式部署                                  │
+└────────────────┴──────────────────────────────────────────────────┘
+```
+
+### Docker Compose 網路設定
+
+```yaml
+# docker-compose.yml
+services:
+  matching-engine:
+    image: matching-engine:latest
+    networks:
+      - backend-net      # 加入後端網路（能和 DB 通訊）
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - backend-net
+
+  nginx:
+    image: nginx:alpine
+    networks:
+      - frontend-net     # 只加入前端網路（只暴露 80/443）
+      - backend-net      # 同時加入後端網路（可轉發到 matching-engine）
+
+networks:
+  frontend-net:          # nginx 和外部流量
+  backend-net:           # 內部服務通訊，外部無法直接存取
+    internal: true       # 標記為純內部網路
+```
+
+---
+
+## 七、Namespace 與 Cgroups — 容器隔離的核心 <!-- 🔴 資深 -->
+
+### Linux Namespace（隔離「看到什麼」）
+
+```
+Namespace 類型        隔離的資源
+─────────────────────────────────────────────────────
+PID Namespace         進程 ID（容器內 PID 1 = Host 上某個 PID）
+Network Namespace     網路介面、IP、路由表、port
+Mount Namespace       檔案系統掛載點（容器有自己的 /proc、/sys）
+UTS Namespace         hostname 和 domain name
+IPC Namespace         進程間通訊（System V IPC、POSIX message queue）
+User Namespace        用戶 ID 映射（容器內 root ≠ Host root）
+
+實際驗證：
+$ docker run -it ubuntu bash
+# 在容器內執行：
+root@abc123:/# ps aux          ← 只看到容器內的進程（PID 隔離）
+root@abc123:/# hostname        ← 顯示容器 ID，不是 Host hostname（UTS 隔離）
+root@abc123:/# ls /proc/net/   ← 看到的是容器的網路資訊（Network 隔離）
+```
+
+### Cgroups（控制「用多少資源」）
+
+```
+Cgroups = Control Groups，Linux Kernel 的資源配額機制
+
+docker run --memory 512m --cpus 1.5 my-app
+                │              │
+                ↓              ↓
+        /sys/fs/cgroup/    /sys/fs/cgroup/
+        memory/docker/<id> cpu/docker/<id>
+        memory.limit_in_bytes  cpu.cfs_quota_us
+              = 536870912            = 150000
+
+撮合引擎生產建議：
+  --memory 2g               最大記憶體 2GB
+  --memory-reservation 1g   軟限制，OOM 前優先回收
+  --cpus 2                  最多用 2 個 CPU Core
+  --pids-limit 1000         防止 fork bomb（進程爆炸）
+```
+
+### 為什麼說「容器不是 VM」？
+
+```
+虛擬機（VM）：
+  ┌──────────────────────┐
+  │  Guest OS Kernel     │  ← 完整的作業系統內核
+  │  └── App             │
+  └──────────────────────┘
+  Hypervisor（硬體模擬）     ← 啟動需要 30~60 秒，需要 GBs RAM
+
+Docker 容器：
+  ┌──────────────────────┐
+  │  App（使用者層）      │
+  │  └── Library         │
+  └──────────────────────┘
+  Host OS Kernel（共用）      ← 直接用 Host 的 Kernel
+  Namespace + Cgroups 隔離    ← 啟動只需要 100ms~1s，只需 MBs RAM
+
+代價：
+  - 所有容器共用同一個 Kernel → 若 Kernel 有漏洞，所有容器受影響
+  - 不支援不同 OS（Linux 容器不能在 Linux Host 上跑 Windows App）
+```
+
+---
+
+## 八、Image 分層與建置優化 <!-- 💡 進階 -->
+
+### Union File System（聯合文件系統）
+
+```
+Image 分層結構（由下往上疊加）：
+
+Layer 5: COPY target/*.jar app.jar     ← 你的應用程式（最常變動）
+Layer 4: RUN mvn dependency:go-offline ← 依賴快取（pom.xml 沒變就不重跑）
+Layer 3: COPY pom.xml .                ← pom.xml
+Layer 2: RUN apt-get install -y curl   ← 系統工具
+Layer 1: FROM eclipse-temurin:21-jre   ← Base Image（幾乎不變）
+
+原理：
+  - 每個 Layer 是不可變的（內容 hash 後存為 tar）
+  - 重新 build 時，只有「發生變動的 Layer 以上」重新執行
+  - Layer 可被不同 Image 共用，節省硬碟空間
+
+關鍵最佳化原則：
+  「變動最頻繁的 Layer 放最上面」
+  「變動最少的 Layer 放最下面」
+```
+
+### 最佳化 Dockerfile（撮合引擎範例）
+
+```dockerfile
+# ────── Build Stage ──────
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /workspace
+
+# 1. 先只複製 pom.xml（依賴幾乎不變），下載依賴並快取這一層
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+
+# 2. 再複製原始碼（每次 commit 都會變）並編譯
+COPY src ./src
+RUN mvn package -DskipTests -B
+
+# ────── Runtime Stage ──────
+FROM eclipse-temurin:21-jre AS runtime
+WORKDIR /app
+
+# 3. 只複製 jar，不包含 JDK、source code、mvn cache
+COPY --from=builder /workspace/target/matching-engine.jar app.jar
+
+# 4. 非 root 用戶執行（安全最佳實踐）
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+USER appuser
+
+# 5. JVM 容器化設定
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+UseG1GC"
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+
+EXPOSE 8080
+```
+
+### 檢查 Image 大小
+
+```bash
+# 查看每一層的大小
+docker history matching-engine:latest
+
+# 結果範例：
+IMAGE          CREATED        CREATED BY                                SIZE
+abc123def456   2 min ago     COPY --from=builder /workspace/target/…   18.2MB
+<missing>      2 min ago     USER appuser                               0B
+<missing>      2 min ago     RUN addgroup…                              4.1KB
+<missing>      ...           FROM eclipse-temurin:21-jre                ← 195MB
+
+# 分析：
+# Base JRE：195MB（無法縮減）
+# 應用程式 jar：18.2MB
+# 相比直接用 JDK Image（~600MB），節省了 ~400MB
+```
+
+---
+
+## 九、Docker Security 安全加固 <!-- 🔴 資深 -->
+
+### 安全最佳實踐清單
+
+```dockerfile
+# ✅ 1. 使用非 root 用戶
+RUN adduser --system --no-create-home appuser
+USER appuser
+
+# ✅ 2. 使用 Read-only 檔案系統（防止容器內寫入惡意檔案）
+# docker run --read-only my-app
+# 或在 docker-compose.yml：
+# read_only: true
+
+# ✅ 3. 掛載 tmpfs 給需要寫入的目錄
+# docker run --read-only --tmpfs /tmp my-app
+
+# ✅ 4. 明確指定 Image 的 Hash（而非 :latest tag）
+FROM eclipse-temurin:21-jre@sha256:abc123...  # 確保 Image 內容不被偷換
+
+# ✅ 5. 不要在 Image 裡存放 Secrets
+# ❌ 錯誤做法：
+ENV DB_PASSWORD=mysecretpassword
+# ✅ 正確做法：透過 docker run -e 或 Kubernetes Secret 注入
+```
+
+### 掃描 Image 漏洞
+
+```bash
+# 使用 Trivy（開源漏洞掃描工具）
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image matching-engine:latest
+
+# 輸出範例：
+# matching-engine:latest (ubuntu 22.04)
+# Total: 3 (HIGH: 1, MEDIUM: 2)
+# ┌─────────────┬──────────────────┬──────────┬─────────┐
+# │  Library    │  Vulnerability   │ Severity │  Fixed  │
+# ├─────────────┼──────────────────┼──────────┼─────────┤
+# │ openssl     │ CVE-2023-0465    │ HIGH     │ 3.0.9   │
+# └─────────────┴──────────────────┴──────────┴─────────┘
+
+# 在 CI/CD 中加入安全掃描（建議）：
+# 當發現 HIGH 或 CRITICAL 漏洞時，讓 CI Pipeline 失敗
+trivy image --exit-code 1 --severity HIGH,CRITICAL matching-engine:latest
+```
+
+---
+
+## 十、Kubernetes 入門 — 從 Docker 到生產部署 <!-- 🔴 資深 -->
+
+### 為什麼需要 Kubernetes（K8s）？
+
+```
+Docker 解決的問題：「如何打包和執行單個應用」
+Kubernetes 解決的問題：「如何在生產環境管理幾十個容器服務」
+
+Docker Compose 的限制：
+  - 只能在單台機器上運作
+  - 節點崩潰時不會自動在其他機器重啟容器
+  - 無法自動水平擴展（scale out）
+  - 沒有內建的負載均衡
+
+Kubernetes 提供：
+  自動排程         → 根據資源需求，決定容器跑在哪台機器
+  自我修復         → 容器崩潰自動重啟；節點掛了自動遷移
+  水平自動擴縮     → 根據 CPU/記憶體使用量自動增減 Pod 數量
+  滾動升級         → 逐步替換舊版本，零停機部署
+  Service Discovery → 容器不需要知道對方的 IP
+```
+
+### 核心概念速覽
+
+```
+K8s 物件 → 你要的「狀態」，K8s 負責讓現實符合它
+
+Pod              最小部署單位，包含 1~N 個容器（通常 1 個）
+                 類比：一個 docker run 啟動的容器群組
+
+Deployment       宣告「我要 3 個 matching-engine Pod 同時運行」
+                 K8s 確保永遠有 3 個健康的 Pod
+
+Service          穩定的訪問入口（Pod 的 IP 會變，Service 的 IP 不變）
+                 類比：Nginx 的 upstream
+
+ConfigMap        設定檔（非機密）注入到容器
+Secret           機密設定（密碼、金鑰）注入到容器（base64 編碼）
+
+HPA              Horizontal Pod Autoscaler，自動水平擴縮
+```
+
+### 撮合引擎的 K8s Deployment 範例
+
+```yaml
+# matching-engine-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matching-engine
+spec:
+  replicas: 3                      # 同時保持 3 個 Pod
+  selector:
+    matchLabels:
+      app: matching-engine
+  template:
+    metadata:
+      labels:
+        app: matching-engine
+    spec:
+      containers:
+        - name: matching-engine
+          image: matching-engine:v1.2.3  # 明確 tag，不用 latest
+          resources:
+            requests:
+              memory: "1Gi"        # 調度時保留的資源下限
+              cpu: "500m"          # 500 millicores = 0.5 CPU
+            limits:
+              memory: "2Gi"        # 最多用 2GB，超過 OOM Kill
+              cpu: "2000m"         # 最多用 2 CPU
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: db-password
+          readinessProbe:          # 就緒探針：OK 才加入 Service 流量
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:           # 存活探針：失敗則重啟 Pod
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+
+---
+# 自動水平擴縮（當 CPU 超過 70% 時增加 Pod）
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: matching-engine-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: matching-engine
+  minReplicas: 2       # 至少 2 個 Pod（高可用）
+  maxReplicas: 10      # 最多 10 個 Pod
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+---
+
 ## 練習題
 
 <details>

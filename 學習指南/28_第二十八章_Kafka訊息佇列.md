@@ -652,6 +652,278 @@ public class TradeNotificationConsumer {
 
 ---
 
+## 六、Producer 深度調優 <!-- 💡 進階 -->
+
+### 批次發送：throughput vs latency 的取捨
+
+```
+Producer 不是每條訊息立刻送出，而是先放到本地緩衝區，湊夠再一起發：
+
+batch.size=16384（16KB）：緩衝區滿了就送
+linger.ms=5：等 5ms，就算沒滿也送
+
+低延遲優先（撮合引擎下單確認）：
+  batch.size=1     linger.ms=0  → 每條馬上送，延遲最低，吞吐量低
+  
+高吞吐優先（成交記錄批次寫入）：
+  batch.size=65536  linger.ms=20 → 等滿或等 20ms，吞吐量高
+```
+
+### 壓縮：CPU 換頻寬
+
+```java
+props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4");
+// 選項：none / gzip / snappy / lz4 / zstd
+//
+// 撮合引擎建議：lz4
+//   - 壓縮率：~50%（訊息從 200 bytes 壓到 100 bytes）
+//   - 壓縮速度極快（< 0.1ms），幾乎不影響延遲
+//   - gzip 壓縮率更高但 CPU 成本 5x，不適合低延遲場景
+```
+
+### acks 設定：可靠性 vs 效能
+
+```
+acks=0：Producer 不等 Broker 確認，直接繼續
+        風險：Broker 崩潰時訊息丟失
+        速度：最快（單向發送）
+        撮合引擎適用：❌（訂單不能丟）
+
+acks=1（預設）：Leader 寫入後確認，不等 Follower
+        風險：Leader 崩潰、Follower 還沒同步時，訊息丟失
+        速度：快
+
+acks=all（acks=-1）：Leader + 所有 ISR Follower 都確認
+        風險：最低（需搭配 min.insync.replicas=2）
+        速度：慢（需等最慢的 Follower）
+        撮合引擎建議：✅ 重要訊息用這個
+```
+
+---
+
+## 七、Consumer 深入與 Rebalance <!-- 💡 進階 -->
+
+### Rebalance 是什麼？為什麼痛苦？
+
+```
+觸發條件：
+  - 新 Consumer 加入 Group
+  - Consumer 離開（crash 或正常關閉）
+  - Topic 新增 Partition
+  - Consumer 處理太慢（超過 max.poll.interval.ms）
+
+Rebalance 過程（舊協定 Eager Rebalance）：
+  1. Coordinator 通知所有 Consumer：停下來！
+  2. 所有 Consumer 放棄手上的 Partition（Stop-the-World！）
+  3. 重新分配 Partition
+  4. 所有 Consumer 重新開始消費
+
+問題：步驟 2~3 期間，沒有任何 Consumer 在工作
+      大型系統 Rebalance 可能需要 30~60 秒
+      撮合引擎期間：成交通知全部堆積在 Kafka，沒有被消費
+```
+
+### 三種 Partition 分配策略
+
+```
+RangeAssignor（預設）：
+  Consumer 數：2，Partition 數：5
+  Consumer A：Partition 0, 1, 2
+  Consumer B：Partition 3, 4
+  問題：分配不均，Consumer A 多做一個
+
+RoundRobinAssignor：
+  輪流分配：A=0,2,4  B=1,3
+  比 Range 更均勻，但 Rebalance 後變動大
+
+StickyAssignor（推薦）：
+  Rebalance 後盡量保留上次的分配
+  只移動必要的 Partition
+  → 減少 offset 重置和重複處理的機率
+```
+
+```java
+// 設定使用 StickyAssignor
+props.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
+    StickyAssignor.class.getName());  // 盡量保留原本的 Partition 分配
+```
+
+### session.timeout.ms vs max.poll.interval.ms（常見面試題）
+
+```
+session.timeout.ms（預設 45000ms）：
+  Consumer 多久沒發心跳就被認為 crash
+  → 觸發 Rebalance
+  → 只和心跳執行緒有關
+
+max.poll.interval.ms（預設 300000ms）：
+  Consumer 兩次 poll() 之間最大間隔
+  → 超過就被踢出 Group（觸發 Rebalance）
+  → 和業務處理時間有關
+
+常見錯誤：
+  Consumer 每次 poll 拿了 500 筆，但每筆要處理 1 秒
+  500 秒 > max.poll.interval.ms（300 秒） → 被踢出 Group！
+
+解法：
+  減少 max.poll.records（每次少拿一點）
+  或增大 max.poll.interval.ms
+  或加快業務處理速度
+```
+
+---
+
+## 八、副本機制與高可用 <!-- 🔴 資深 -->
+
+### ISR（In-Sync Replicas）
+
+```
+ISR 的定義：「最近 10 秒內有跟上 Leader 進度的 Follower 集合」
+（由 replica.lag.time.max.ms=10000 控制）
+
+正常狀態（3 個 Broker，replication.factor=3）：
+  Leader: Broker 1   ISR: [1, 2, 3]
+  
+Broker 3 網路慢，lag 超過 10 秒：
+  Leader: Broker 1   ISR: [1, 2]   OSR: [3]
+  → Broker 3 被踢出 ISR，不再計入 acks=all 的確認數
+
+acks=all + min.insync.replicas=2 的含義：
+  至少 2 個 ISR（含 Leader）確認寫入才回傳成功
+  即使 Broker 3 掛掉，只要 Broker 1+2 都在，就能繼續服務
+```
+
+### Leader 選舉流程
+
+```
+當 Leader（Broker 1）掛掉時：
+
+1. Controller Broker（由 ZooKeeper 或 KRaft 選出）偵測到
+2. Controller 從 ISR 中選出新 Leader（通常是 ISR 中第一個）
+3. 通知所有 Broker 新的 Leader 是誰
+4. Producer 和 Consumer 重新連接新 Leader
+
+整個過程：通常 5~30 秒
+
+unclean.leader.election.enable=false（強烈建議）：
+  如果 ISR 全空（所有副本都掉隊），是否允許 OSR 成為 Leader？
+  false = 寧願服務中斷，也不選落後的 Follower（避免資料丟失）
+  true  = 服務繼續，但可能丟失還沒同步的訊息
+  撮合引擎：永遠設 false（訂單丟失 = 財務損失）
+```
+
+### KRaft 模式：告別 ZooKeeper <!-- 🔴 資深 -->
+
+```
+Kafka 2.8+ 引入 KRaft，3.3+ 穩定，目標是移除 ZooKeeper 依賴
+
+舊架構：Kafka + ZooKeeper（兩套系統要維護）
+新架構：Kafka 用自己的 Raft 共識算法管理 metadata
+
+好處：
+  - 啟動更快（不需等 ZooKeeper）
+  - Controller 選舉更快（秒級 vs 分鐘級）
+  - 支援更多 Partition（百萬級 vs 幾萬級）
+  - 部署更簡單
+
+docker-compose.yml 改動（KRaft 模式）：
+  去掉 zookeeper 服務
+  Kafka 改用 KAFKA_PROCESS_ROLES=broker,controller
+```
+
+---
+
+## 九、Kafka Streams：在 Kafka 內做計算 <!-- 🔴 資深 -->
+
+### 為什麼需要 Kafka Streams？
+
+```
+傳統方式：Consumer 讀 → 外部系統計算 → 寫回 Kafka
+Kafka Streams：在 Kafka 的 JVM 函式庫內做計算，無需額外系統
+
+撮合引擎應用：實時計算 VWAP（成交量加權平均價）
+
+        trade-executed topic
+              ↓
+        Kafka Streams 計算
+              ↓
+        每 5 秒輸出 VWAP
+              ↓
+        vwap-prices topic
+              ↓
+        前端 WebSocket 推送
+```
+
+```java
+import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.kstream.*;
+
+Properties props = new Properties();
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "vwap-calculator");
+props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+
+StreamsBuilder builder = new StreamsBuilder();
+
+// 讀取成交事件
+KStream<String, TradeEvent> trades =
+    builder.stream("trade-executed");
+
+// 每 5 秒計算一次 VWAP（按 symbol 分組）
+trades
+    .groupByKey()  // 按 symbol 分組
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofSeconds(5)))
+    .aggregate(
+        VwapAccumulator::new,     // 初始化累加器
+        (key, trade, acc) -> acc.add(trade.price, trade.quantity),  // 累加
+        Materialized.with(Serdes.String(), vwapSerde)
+    )
+    .toStream()
+    .map((windowedKey, acc) -> KeyValue.pair(
+        windowedKey.key(),        // symbol
+        acc.calculateVwap()       // price * qty / total_qty
+    ))
+    .to("vwap-prices");  // 寫入結果 topic
+
+KafkaStreams streams = new KafkaStreams(builder.build(), props);
+streams.start();
+```
+
+---
+
+## 十、監控指標與調優速查表 <!-- 💡 進階 -->
+
+### 必看的 Kafka Metrics
+
+```bash
+# 查看 Consumer Group 的 lag（最重要的指標）
+kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group matching-engine-group
+
+# 輸出：
+# GROUP           TOPIC          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+# matching-engine trade-executed 0          1234            1234            0    ← 沒有 lag，正常
+# matching-engine trade-executed 1          1100            1234            134  ← lag 134，Consumer 跟不上！
+
+# lag > 0 且持續增大 = Consumer 處理速度不夠 → 需要擴容（加 Consumer）
+```
+
+### 效能調優參數速查
+
+| 參數 | 預設值 | 調優建議 | 說明 |
+|------|--------|---------|------|
+| `batch.size` | 16384 | 65536~262144 | 批次緩衝大小，高吞吐場景加大 |
+| `linger.ms` | 0 | 5~20 | 等待湊批的時間，低延遲場景設 0 |
+| `compression.type` | none | lz4 | 壓縮節省頻寬，lz4 最快 |
+| `acks` | 1 | all | 重要訊息設 all |
+| `min.insync.replicas` | 1 | 2 | 搭配 acks=all 防止資料丟失 |
+| `max.poll.records` | 500 | 100~200 | 業務重的 Consumer 減少每批數量 |
+| `fetch.min.bytes` | 1 | 1024~65536 | Consumer 每次 fetch 的最小資料量 |
+| `num.partitions` | 1 | CPU 核數 × Broker 數 | 決定並行消費能力上限 |
+
+---
+
 ## 六、本章小結
 
 ```

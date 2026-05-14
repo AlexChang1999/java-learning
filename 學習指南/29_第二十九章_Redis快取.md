@@ -757,6 +757,463 @@ epoll（多路復用）：
 
 ---
 
+## 六、Pipeline 與批次優化 <!-- 💡 進階 -->
+
+### 為什麼要用 Pipeline？
+
+每次 Redis 命令都有一次 RTT（Round-Trip Time）。如果你的 Redis 在同機房，RTT ≈ 0.1ms；如果是跨雲端，RTT 可能 1~5ms。
+
+```
+單命令模式（100 個命令）：
+  100 × 1ms RTT = 100ms 總延遲
+
+Pipeline 模式（100 個命令打包）：
+  1 × 1ms RTT + 伺服器批次處理 ≈ 2ms 總延遲
+  速度提升約 50 倍
+```
+
+### Spring Data Redis 的 Pipeline 寫法
+
+```java
+// executePipelined：在同一次 TCP 傳輸中送出所有命令
+List<Object> results = redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+    for (String orderId : orderIds) {
+        // pipelined 內的命令不會立即執行，全部打包後才送出
+        connection.get(("order:" + orderId).getBytes());
+    }
+    return null; // 必須回傳 null，結果透過 results 取得
+});
+
+// results.get(i) 對應第 i 個命令的回傳值
+for (int i = 0; i < orderIds.size(); i++) {
+    byte[] data = (byte[]) results.get(i);
+    if (data != null) {
+        Order order = deserialize(data);
+        // 處理訂單...
+    }
+}
+```
+
+### Pipeline vs MGET 的選擇
+
+| 情境 | 推薦方案 |
+|------|---------|
+| 批次讀取同類型 key | `MGET`（原生批次，更簡潔）|
+| 批次讀寫混合操作 | Pipeline |
+| 需要原子性 | Lua Script（Pipeline 不保證原子） |
+
+---
+
+## 七、分散式鎖與 Redlock <!-- 🔴 資深 -->
+
+### 為什麼需要分散式鎖？
+
+撮合引擎場景：多個 Pod 同時收到同一個 `orderId` 的撮合請求，如果沒有鎖，同一筆訂單可能被撮合兩次。
+
+```
+Pod-A ─────────────────────────────────────────┐
+         讀 order_123 → 未撮合                  │
+         ↓（在這中間 Pod-B 也讀到未撮合）       │
+         執行撮合 order_123                     │
+                                                 ↓
+Pod-B ──────────────────────┐           雙重撮合！
+         讀 order_123 → 未撮合
+         ↓
+         執行撮合 order_123
+```
+
+### 基礎分散式鎖實作
+
+```java
+@Service
+public class RedisDistributedLock {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    /**
+     * 嘗試加鎖
+     * @param lockKey  鎖的名稱（例如 "lock:order:123"）
+     * @param value    鎖的持有者識別（例如 UUID，用來防止別人解自己的鎖）
+     * @param timeout  鎖的超時時間（防止程序崩潰後鎖永不釋放）
+     */
+    public boolean tryLock(String lockKey, String value, Duration timeout) {
+        // SET key value NX PX ttl — NX 表示 key 不存在才設定（原子操作）
+        Boolean result = redisTemplate.opsForValue()
+            .setIfAbsent(lockKey, value, timeout);
+        return Boolean.TRUE.equals(result);
+    }
+
+    /**
+     * 釋放鎖（用 Lua Script 確保原子性：比對 value 再刪除）
+     * 為什麼需要 Lua？
+     * 如果用 GET 再 DEL 兩步，中間可能被別的 Pod 搶走鎖，
+     * 導致你把別人的鎖刪掉！
+     */
+    public boolean releaseLock(String lockKey, String value) {
+        String luaScript = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """;
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(luaScript, Long.class),
+            Collections.singletonList(lockKey),
+            value
+        );
+        return Long.valueOf(1).equals(result);
+    }
+}
+
+// 使用方式
+@Service
+public class OrderMatchingService {
+
+    public void matchOrder(String orderId) {
+        String lockKey = "lock:order:" + orderId;
+        String lockValue = UUID.randomUUID().toString(); // 每次唯一，防誤刪
+
+        if (!lock.tryLock(lockKey, lockValue, Duration.ofSeconds(5))) {
+            throw new ConcurrentModificationException("訂單正在被其他節點處理");
+        }
+        try {
+            // 安全地執行撮合邏輯
+            doMatch(orderId);
+        } finally {
+            lock.releaseLock(lockKey, lockValue); // 一定要在 finally 釋放
+        }
+    }
+}
+```
+
+### Redlock：單點 Redis 的鎖不夠可靠 <!-- 🔴 資深 -->
+
+**問題**：如果 Redis 在你加鎖後、資料同步到 Replica 前就崩潰了，新的 Master 上沒有這把鎖，其他 Pod 又能加鎖 → 鎖失效。
+
+**Redlock 演算法**（Redis 作者 antirez 提出）：
+```
+準備：部署 5 個獨立的 Redis Master（不互相複製）
+
+步驟：
+1. 記錄當前時間 T1
+2. 依序向 5 個 Redis 嘗試用相同 key+value 加鎖（每個最多等 timeout/10）
+3. 若在超過半數（≥3）的 Redis 上加鎖成功，
+   且總耗時 < 鎖超時時間，則認為加鎖成功
+4. 若失敗（成功數 < 3 或超時），對所有已成功的 Redis 解鎖
+
+安全性原理：
+  - 就算其中 2 個 Redis 崩潰，仍有 3 個存活 → 法定人數（Quorum）
+  - 任何一個客戶端最多持有「多數派」的鎖，不可能兩個客戶端同時持有
+```
+
+```java
+// 使用 Redisson（Redlock 的成熟實作）
+@Configuration
+public class RedissonConfig {
+
+    @Bean
+    public RedissonClient redissonClient() {
+        // 配置 5 個獨立 Redis
+        Config config = new Config();
+        config.useClusterServers()
+            .addNodeAddress(
+                "redis://redis1:6379",
+                "redis://redis2:6379",
+                "redis://redis3:6379",
+                "redis://redis4:6379",
+                "redis://redis5:6379"
+            );
+        return Redisson.create(config);
+    }
+}
+
+// 使用 Redlock
+RLock lock = redissonClient.getLock("lock:order:" + orderId);
+boolean locked = lock.tryLock(100, 5000, TimeUnit.MILLISECONDS);
+// 100ms 最多等待時間，5000ms 鎖超時
+```
+
+### 分散式鎖的注意事項
+
+```
+⚠️ 常見錯誤：
+  1. 忘記設超時時間 → 程序崩潰後鎖永遠不釋放
+  2. 鎖超時時間 < 業務執行時間 → 鎖提前釋放，重入問題
+  3. 用簡單 DEL 釋放鎖 → 可能刪掉別人的鎖
+
+💡 Redisson 的 Watchdog 機制：
+  - 持有鎖的線程每 10 秒自動續期（預設鎖 30 秒）
+  - 業務執行中不會因超時而鎖失效
+  - 程序崩潰後不再續期 → 等超時自動釋放
+```
+
+---
+
+## 八、Redis Sentinel 高可用架構 <!-- 🔴 資深 -->
+
+### 為什麼 Redis 需要 HA？
+
+單個 Redis 是 SPOF（Single Point of Failure，單點故障）。撮合引擎掛了沒法用，但如果快取掛了，所有請求都打到資料庫 → Cache Stampede（快取踩踏），DB 直接被打垮。
+
+### Sentinel 架構
+
+```
+                     ┌─────────────┐
+                     │  Sentinel 1 │
+                     └──────┬──────┘
+                            │ 監控 + 投票
+         ┌──────────────────┼──────────────────┐
+         ↓                  ↓                  ↓
+  ┌────────────┐    ┌─────────────┐    ┌─────────────┐
+  │  Sentinel 2│    │  Sentinel 3 │    │  Sentinel N │
+  └────────────┘    └─────────────┘    └─────────────┘
+         │                  │                  │
+         └──────────────────┼──────────────────┘
+                            │ 監控
+                ┌───────────┴───────────┐
+                ↓                       ↓
+         ┌────────────┐         ┌──────────────┐
+         │   Master   │ ──同步──→│   Replica   │
+         │  (讀寫)    │         │  (唯讀備份)  │
+         └────────────┘         └──────────────┘
+
+故障切換流程：
+1. Sentinel 偵測到 Master 無回應（超過 down-after-milliseconds）
+2. Sentinel 之間投票（需要過半數 → 防腦裂）
+3. 選出新 Master（優先選 Replica offset 最大的）
+4. 通知所有客戶端新的 Master 地址
+```
+
+### Spring Boot 連接 Sentinel
+
+```yaml
+# application.yml
+spring:
+  data:
+    redis:
+      sentinel:
+        master: mymaster          # Sentinel 中設定的 Master 名稱
+        nodes:
+          - sentinel1:26379
+          - sentinel2:26379
+          - sentinel3:26379
+      password: your-password
+      lettuce:
+        pool:
+          max-active: 20
+```
+
+### Sentinel vs Cluster 選擇
+
+| 特性 | Sentinel | Cluster |
+|------|---------|---------|
+| 目的 | 高可用（HA） | 水平擴展 + HA |
+| 資料分片 | 否，全量在一個 Master | 是，16384 slot 分散 |
+| 適合資料量 | < 數十 GB | > 數十 GB |
+| 複雜度 | 低 | 高 |
+| 撮合引擎建議 | ✅ 初期足夠 | 考慮資料量超過時再遷移 |
+
+---
+
+## 九、Redis Cluster 分片原理 <!-- 🔴 資深 -->
+
+### Hash Slot 機制
+
+Redis Cluster 將所有 key 對映到 16384 個 Slot（槽位），再把這些槽位分給不同的 Master：
+
+```
+16384 個 Slot
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Master-A：Slot 0 ~ 5460        （共 5461 個 slot）             │
+│  Master-B：Slot 5461 ~ 10922    （共 5462 個 slot）             │
+│  Master-C：Slot 10923 ~ 16383   （共 5461 個 slot）             │
+└─────────────────────────────────────────────────────────────────┘
+
+定位公式：
+  slot = CRC16(key) % 16384
+
+例如：
+  key = "order:123"
+  CRC16("order:123") = 12345
+  12345 % 16384 = 12345  → 落在 Master-C
+```
+
+### Hash Tag — 強制同一個節點
+
+```java
+// 問題：Pipeline 或 Multi-exec（Transaction）要求 key 在同一個節點
+// 若 order:123 和 trade:123 落在不同節點，跨節點事務不支援
+
+// 解法：用 {} 包住決定 slot 的部分（Hash Tag）
+String orderKey = "{order:123}:detail";   // slot = CRC16("order:123")
+String tradeKey = "{order:123}:trade";    // slot = CRC16("order:123") ← 相同！
+
+// 這樣兩個 key 一定在同一個節點，可以放進 Pipeline
+```
+
+### 常見坑
+
+```
+⚠️ Cluster 不支援跨節點的 MGET（除非所有 key 同 slot）
+⚠️ Cluster 不支援多 key 的 Lua Script（除非同 slot）
+⚠️ 節點遷移中（Resharding）部分 key 暫時不可用
+
+💡 設計建議：
+  - 同一業務的相關 key 用 Hash Tag 綁在同節點
+  - 例如："{user:1001}:profile", "{user:1001}:orders", "{user:1001}:cache"
+```
+
+---
+
+## 十、Lua Script — 原子性複合操作 <!-- 🔴 資深 -->
+
+### 為什麼需要 Lua？
+
+Redis 是單執行緒，但多個命令之間仍可能被其他客戶端打斷。Lua Script 在 Redis 中是原子執行的（執行中不會切換到其他命令）。
+
+```
+不安全的「讀-改-寫」：
+  GET balance       ← 客戶端 A 讀到 100
+                    ← 客戶端 B 也讀到 100，同時扣款 50 → 寫回 50
+  SET balance 50    ← 客戶端 A 扣款 30 → 寫回 70（把 B 的修改覆蓋！）
+
+Lua Script（原子）：
+  EVAL "
+    local bal = redis.call('get', KEYS[1])
+    if tonumber(bal) >= tonumber(ARGV[1]) then
+      redis.call('set', KEYS[1], tonumber(bal) - tonumber(ARGV[1]))
+      return 1  -- 成功
+    end
+    return 0    -- 餘額不足
+  " 1 balance 30
+  ← 整段原子執行，不會被中斷
+```
+
+### 撮合引擎中的 Lua 應用
+
+```java
+/**
+ * 撮合成交後，原子更新買單和賣單的剩餘數量
+ * 如果任一數量不足，整個操作回滾
+ */
+@Service
+public class AtomicMatchService {
+
+    private static final String MATCH_SCRIPT = """
+        local buyQty  = tonumber(redis.call('hget', KEYS[1], 'remainQty'))
+        local sellQty = tonumber(redis.call('hget', KEYS[2], 'remainQty'))
+        local matchQty = tonumber(ARGV[1])
+        
+        -- 檢查兩邊數量是否足夠
+        if buyQty < matchQty or sellQty < matchQty then
+            return {0, buyQty, sellQty}  -- 失敗，回傳現況供除錯
+        end
+        
+        -- 原子扣減
+        redis.call('hset', KEYS[1], 'remainQty', buyQty  - matchQty)
+        redis.call('hset', KEYS[2], 'remainQty', sellQty - matchQty)
+        
+        -- 記錄成交
+        redis.call('rpush', 'trades', ARGV[2])  -- ARGV[2] = trade JSON
+        
+        return {1, buyQty - matchQty, sellQty - matchQty}
+        """;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public MatchResult atomicMatch(String buyOrderId, String sellOrderId,
+                                   long matchQty, String tradeJson) {
+        List<String> keys = List.of(
+            "order:" + buyOrderId,
+            "order:" + sellOrderId
+        );
+        List<String> args = List.of(
+            String.valueOf(matchQty),
+            tradeJson
+        );
+
+        List<Long> result = redisTemplate.execute(
+            new DefaultRedisScript<>(MATCH_SCRIPT, List.class),
+            keys,
+            args.toArray()
+        );
+
+        return new MatchResult(result.get(0) == 1L, result.get(1), result.get(2));
+    }
+}
+```
+
+---
+
+## 十一、記憶體回收策略（Eviction Policy） <!-- 💡 進階 -->
+
+### 8 種策略一覽
+
+當 Redis 達到 `maxmemory` 上限時，新寫入會觸發回收：
+
+| 策略 | 說明 | 適合場景 |
+|------|------|---------|
+| `noeviction` | 拒絕新寫入，回傳錯誤 | 資料不能丟失（資料庫模式） |
+| `allkeys-lru` | 從所有 key 中驅逐最久未使用的 | **通用快取（推薦）** |
+| `volatile-lru` | 只驅逐有設過期時間的 key（LRU） | 想保護永久 key |
+| `allkeys-lfu` | 從所有 key 中驅逐存取頻率最低的 | 熱點資料差異大時更精準 |
+| `volatile-lfu` | 只驅逐有過期時間的 key（LFU） | 同上，保護永久 key |
+| `allkeys-random` | 隨機驅逐任意 key | 幾乎不用 |
+| `volatile-random` | 隨機驅逐有過期時間的 key | 幾乎不用 |
+| `volatile-ttl` | 優先驅逐剩餘過期時間最短的 | 明確依賴 TTL 排優先級時 |
+
+### LRU vs LFU 的硬體直覺
+
+```
+LRU（Least Recently Used，最久未使用）：
+  假設：「最近用過的東西，近期還會再用」
+  類比：CPU L1 Cache 的替換策略
+
+LFU（Least Frequently Used，使用頻率最低）：
+  假設：「被存取最多次的是真正的熱點」
+  類比：更精準但計數有開銷
+
+撮合引擎快取建議：
+  - Order Book（行情資料）：用 LFU，熱門股票遠比冷門股票存取頻繁
+  - 用戶 Session：用 LRU，最近登入的用戶更可能繼續操作
+```
+
+---
+
+## 十二、Redis 效能監控指標速查表 <!-- 💡 進階 -->
+
+```bash
+# 查看記憶體使用
+redis-cli info memory | grep -E "used_memory_human|maxmemory_human|mem_fragmentation_ratio"
+
+# 查看命中率（hit_rate 應 > 90%，否則快取設計有問題）
+redis-cli info stats | grep -E "keyspace_hits|keyspace_misses"
+# hit_rate = hits / (hits + misses)
+
+# 查看連線數（too_many_connections 的前兆）
+redis-cli info clients | grep connected_clients
+
+# 查看慢命令（預設 >10ms 算慢）
+redis-cli slowlog get 10
+
+# 查看 key 數量與過期情況
+redis-cli info keyspace
+```
+
+| 指標 | 正常範圍 | 異常處理 |
+|------|---------|---------|
+| `hit_rate` | > 90% | 檢查 TTL 設定 / 熱點 key 是否過早被驅逐 |
+| `mem_fragmentation_ratio` | 1.0 ~ 1.5 | > 1.5 代表記憶體碎片多，執行 `MEMORY PURGE` |
+| `connected_clients` | < `maxclients`（預設 10000） | 檢查連線池是否有洩漏 |
+| `blocked_clients` | 0 | > 0 代表有 BLPOP/BRPOP 等待，確認是否正常業務 |
+| `slowlog len` | 0（生產環境） | 查慢命令，考慮 Pipeline 或 Lua 優化 |
+
+---
+
 ## 練習題
 
 <details>

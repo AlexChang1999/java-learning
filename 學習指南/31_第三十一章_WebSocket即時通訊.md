@@ -646,6 +646,376 @@ JVM Thread 的預設 Stack 大小 = 512KB ~ 1MB
 
 ---
 
+## 六、WebSocket Frame 格式深度解析 <!-- 💡 進階 -->
+
+### Frame 結構（RFC 6455）
+
+WebSocket 並不是直接傳字串，而是用固定格式的 **Frame（訊框）** 包裝資料：
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+├─┬─┬─┬─┬─────────┬─┬─────────────────────────────────────────────┤
+│F│R│R│R│  Opcode │M│          Payload Length                      │
+│I│S│S│S│  (4bit) │A│             (7/16/64 bit)                    │
+│N│V│V│V│         │S│                                              │
+│ │1│2│3│         │K│                                              │
+├─┴─┴─┴─┴─────────┼─┴──────────────────────────────────────────────┤
+│                  │    Masking Key (32bit, 若 MASK=1)              │
+├──────────────────┴────────────────────────────────────────────────┤
+│                       Payload Data                                │
+└───────────────────────────────────────────────────────────────────┘
+
+FIN  = 1 表示這是訊息的最後一個 Fragment（分片）
+Opcode：
+  0x0 = Continuation（接續前一個分片）
+  0x1 = Text（UTF-8 文字）
+  0x2 = Binary（二進制）
+  0x8 = Close（關閉連線）
+  0x9 = Ping（心跳請求）
+  0xA = Pong（心跳回應）
+MASK = 1 表示 Payload 被 Masking Key XOR 過（客戶端到伺服器必須 Mask）
+```
+
+### 為什麼客戶端必須 Mask？
+
+```
+安全考量（防止 Cache Poisoning Attack）：
+  早期發現：若不 Mask，惡意 JavaScript 可以偽造 HTTP Response 格式，
+  騙過中間的代理伺服器（proxy），讓 proxy 把惡意資料快取起來。
+
+硬體開銷：
+  Mask 操作 = 每個 byte XOR 4-byte key 的某一個 byte
+  對於 1KB 訊息 = 1024 次 XOR 運算
+  現代 CPU：1 ns / XOR → 1024 × 1 ns ≈ 1μs（幾乎可以忽略）
+```
+
+### Binary vs Text Frame
+
+```java
+// Text Frame（常見，但 JSON 序列化有開銷）
+session.sendMessage(new TextMessage("{\"type\":\"ORDER_BOOK\",\"price\":100.0}"));
+
+// Binary Frame（適合高頻撮合推送，減少序列化開銷）
+// 例如用 Protobuf 序列化
+OrderBookUpdate update = OrderBookUpdate.newBuilder()
+    .setPrice(100_000L)    // 整數避免浮點誤差，單位：分
+    .setQuantity(500L)
+    .setAction(Action.ADD)
+    .build();
+session.sendMessage(new BinaryMessage(update.toByteArray()));
+
+// Protobuf vs JSON 效能對比：
+//   JSON：{"price":100.0,"quantity":500,"action":"ADD"} = ~45 bytes
+//   Protobuf：同樣資料 ≈ 8 bytes（大約省 80%，解析速度快 5-10 倍）
+```
+
+---
+
+## 七、多節點廣播：Redis Pub/Sub <!-- 🔴 資深 -->
+
+### 問題：為什麼單節點 WebSocket 不夠？
+
+```
+沒有 Redis Pub/Sub 的問題：
+
+用戶 A 的 WebSocket 連線在 Pod-1
+用戶 B 的 WebSocket 連線在 Pod-2
+訂單撮合發生在 Pod-1
+
+Pod-1 可以推給用戶 A ✅
+Pod-1 無法直接推給在 Pod-2 上的用戶 B ❌
+
+即使用 SimpMessagingTemplate 廣播，
+訊息只會發給「連到這個 Pod」的用戶！
+```
+
+### 解法：Redis Pub/Sub 作為 Message Broker
+
+```
+撮合結果
+    │
+    ↓
+[Pod-1] PUBLISH channel "trade_event" message
+    │
+    ↓  Redis Pub/Sub 廣播
+    ├─────────────────────────┐
+    ↓                         ↓
+[Pod-1 訂閱者]           [Pod-2 訂閱者]
+  接收訊息                  接收訊息
+  推給本節點的 WS 用戶      推給本節點的 WS 用戶
+```
+
+### 實作：Spring Boot + Redis Pub/Sub + WebSocket
+
+```java
+// 1. 設定 Redis Message Listener
+@Configuration
+public class RedisPubSubConfig {
+
+    @Bean
+    public MessageListenerAdapter tradeListener(TradeEventHandler handler) {
+        // handleMessage 是 TradeEventHandler 中接收訊息的方法名稱
+        return new MessageListenerAdapter(handler, "handleMessage");
+    }
+
+    @Bean
+    public RedisMessageListenerContainer container(
+            RedisConnectionFactory factory,
+            MessageListenerAdapter tradeListener) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        // 訂閱 "trade-events" channel
+        container.addMessageListener(tradeListener, new PatternTopic("trade-events"));
+        return container;
+    }
+}
+
+// 2. 接收 Redis 訊息，推送給 WebSocket 客戶端
+@Component
+public class TradeEventHandler {
+
+    @Autowired
+    private SimpMessagingTemplate messagingTemplate;
+
+    /**
+     * 每當 Redis "trade-events" channel 有訊息，這個方法就被呼叫
+     * 不管訊息是哪個 Pod 發佈的！
+     */
+    public void handleMessage(String message) {
+        TradeEvent event = parseJson(message, TradeEvent.class);
+        // 廣播給訂閱這個 topic 的所有 WebSocket 客戶端（本節點上的）
+        messagingTemplate.convertAndSend("/topic/trades/" + event.getSymbol(), event);
+    }
+}
+
+// 3. 撮合完成後，發佈到 Redis
+@Service
+public class MatchingService {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    public void publishTradeResult(TradeEvent event) {
+        String json = toJson(event);
+        // PUBLISH 廣播到所有訂閱的 Pod
+        redisTemplate.convertAndSend("trade-events", json);
+    }
+}
+```
+
+### Redis Pub/Sub 的限制
+
+```
+⚠️ 注意事項：
+  1. 訊息不持久化：Redis Pub/Sub 是 Fire-and-Forget
+     若 Pod 在收到訊息前崩潰，訊息遺失
+     → 若需要可靠投遞，改用 Redis Streams 或 Kafka
+
+  2. 無法查詢歷史訊息
+     → 客戶端重連後需主動拉取最新狀態
+
+  3. 高頻場景下 Redis Pub/Sub 會成為瓶頸
+     → 行情推送頻率 > 10,000/s 時考慮 Kafka
+
+💡 撮合引擎建議：
+  - 低頻（成交回報）：Redis Pub/Sub 足夠，延遲 < 1ms
+  - 高頻（每隔 100ms 的行情快照）：Redis Pub/Sub 可行
+  - 超高頻（tick-by-tick 逐筆行情）：考慮 Kafka + 前端 WebSocket 分離
+```
+
+---
+
+## 八、Backpressure 背壓控制 <!-- 🔴 資深 -->
+
+### 什麼是 Backpressure？
+
+```
+問題：生產者（撮合引擎）產生訊息的速度 > 消費者（客戶端）能接收的速度
+
+                    ╔════════════╗
+  撮合引擎  ──────→ ║ WebSocket  ║ ──────→  客戶端（手機，網速慢）
+  10,000 msg/s     ║  Buffer    ║          能處理 100 msg/s
+                    ╚════════════╝
+                        ↓
+                    Buffer 滿 → OOM 或訊息堆積
+```
+
+### Spring WebSocket 的 Backpressure 設定
+
+```java
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/topic", "/queue")
+            // 設定 outbound channel 的 buffer 大小
+            // 超過這個大小會丟棄訊息（而非無限堆積導致 OOM）
+            .setTaskScheduler(heartbeatScheduler())
+            .setCacheLimit(1024);  // 預設 1024 訊息
+    }
+
+    @Override
+    public void configureWebSocketTransport(WebSocketTransportRegistration registry) {
+        registry
+            .setMessageSizeLimit(64 * 1024)        // 單個訊息最大 64KB
+            .setSendBufferSizeLimit(512 * 1024)     // 每個 session 的發送 buffer 512KB
+            .setSendTimeLimit(20_000);              // 20 秒送不出去就斷線
+    }
+}
+```
+
+### 應用層 Backpressure：訊息合併（Throttling）
+
+```java
+/**
+ * 行情推送節流：不管撮合多快，客戶端最多每 100ms 收到一次更新
+ * 思路：用一個定時任務，每 100ms 抓最新快照推送，而非每次成交都推
+ */
+@Component
+public class MarketDataThrottler {
+
+    // 用 ConcurrentHashMap 存每個 symbol 的「最新行情」（只保留最新）
+    private final Map<String, OrderBookSnapshot> latestSnapshots = new ConcurrentHashMap<>();
+
+    @Autowired
+    private SimpMessagingTemplate messagingTemplate;
+
+    // 撮合每次更新只更新 Map，不直接推送
+    public void updateSnapshot(String symbol, OrderBookSnapshot snapshot) {
+        latestSnapshots.put(symbol, snapshot);  // 新的快照覆蓋舊的
+    }
+
+    // 每 100ms 統一推送一次（即使撮合發生了 1000 次，客戶端只收到 1 次）
+    @Scheduled(fixedRate = 100)
+    public void flushSnapshots() {
+        latestSnapshots.forEach((symbol, snapshot) -> {
+            messagingTemplate.convertAndSend("/topic/orderbook/" + symbol, snapshot);
+        });
+        latestSnapshots.clear();
+    }
+}
+```
+
+---
+
+## 九、Spring WebFlux 響應式 WebSocket <!-- 🔴 資深 -->
+
+### 為什麼需要 WebFlux？
+
+```
+傳統 Spring MVC + WebSocket（Servlet-based）：
+  每個 WebSocket 連線需要 1 個 Thread 維持
+  10,000 連線 × 1MB stack = 10GB RAM
+  線程切換成本：~5-30μs × 頻繁切換 = 高延遲
+
+Spring WebFlux（Reactive, Netty-based）：
+  使用 Event Loop（類似 Node.js）
+  1 個 CPU core ≈ 1 個 Event Loop Thread 處理所有 IO
+  10,000 連線 × 同一個 Event Loop = 共用少量 Thread
+  IO 等待時不佔用 Thread，延遲更低
+
+適用時機：
+  - 連線數 > 10,000，且訊息大多是 IO bound（等待資料）
+  - 需要背壓（Reactive Streams 原生支援背壓）
+```
+
+### WebFlux WebSocket Handler
+
+```java
+@Component
+public class ReactiveOrderBookHandler implements WebSocketHandler {
+
+    @Autowired
+    private OrderBookService orderBookService;
+
+    @Override
+    public Mono<Void> handle(WebSocketSession session) {
+        // Flux.interval 每 100ms 發射一個事件
+        Flux<WebSocketMessage> outbound = Flux.interval(Duration.ofMillis(100))
+            .map(tick -> {
+                // 每次 tick 取最新行情
+                OrderBookSnapshot snapshot = orderBookService.getLatestSnapshot("BTC/USD");
+                return session.textMessage(toJson(snapshot));
+            })
+            // 背壓策略：超過 16 個 buffer 就丟棄最舊的（而非堆積）
+            .onBackpressureLatest();  // 只保留最新的，其餘丟棄
+
+        // 接收客戶端訊息（例如訂閱不同的 symbol）
+        Flux<String> inbound = session.receive()
+            .map(WebSocketMessage::getPayloadAsText)
+            .doOnNext(msg -> handleSubscription(session.getId(), msg))
+            .thenMany(Flux.empty());
+
+        // merge：同時處理 inbound 和 outbound
+        return session.send(outbound).and(inbound);
+    }
+}
+
+// 路由設定
+@Bean
+public RouterFunction<ServerResponse> wsRoute(ReactiveOrderBookHandler handler) {
+    return RouterFunctions.route()
+        .GET("/ws/orderbook", request ->
+            ServerResponse.ok().build(/* HandshakeWebSocketService */))
+        .build();
+}
+```
+
+---
+
+## 十、WebSocket 安全性 <!-- 💡 進階 -->
+
+### 認證（Authentication）
+
+```java
+/**
+ * 問題：WebSocket 握手是 HTTP，之後就不再是 HTTP 了，
+ * 所以 Spring Security 的 HTTP filter 在握手後不再生效。
+ * 解法：在握手階段驗證 JWT Token。
+ */
+@Configuration
+public class WebSocketSecurityConfig extends AbstractSecurityWebSocketMessageBrokerConfigurer {
+
+    @Override
+    protected void configureInbound(MessageSecurityMetadataSourceRegistry messages) {
+        messages
+            .nullDestMatcher().authenticated()           // 連線本身需要認證
+            .simpSubscribeDestMatchers("/topic/**").authenticated()  // 訂閱需要認證
+            .simpDestMatchers("/app/**").authenticated() // 發送訊息需要認證
+            .anyMessage().denyAll();                     // 其餘全拒絕
+    }
+
+    @Override
+    protected boolean sameOriginDisabled() {
+        return true; // 若前端和後端不同 origin，需要關閉 CSRF 保護
+    }
+}
+
+// 客戶端連線時帶上 JWT（在 query string 或 header）
+// ws://your-server/ws?token=eyJhbGciOiJIUzI1NiJ9...
+@Component
+public class JwtHandshakeInterceptor implements HandshakeInterceptor {
+
+    @Override
+    public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
+                                   WebSocketHandler wsHandler, Map<String, Object> attributes) {
+        // 從 URL 參數取得 token
+        String token = getTokenFromRequest(request);
+        if (token != null && jwtService.validateToken(token)) {
+            // 把解析出來的用戶資訊存入 WebSocket session attributes
+            attributes.put("userId", jwtService.getUserId(token));
+            return true;   // 允許握手
+        }
+        return false;  // 拒絕握手
+    }
+}
+```
+
+---
+
 ## 練習題
 
 <details>
