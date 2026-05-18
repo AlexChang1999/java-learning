@@ -565,6 +565,201 @@ public class OrderController {
 
 ---
 
+## 九、Spring Bean 完整生命週期 <!-- 💡 進階 -->
+
+理解 Bean 的完整生命週期，是解決「Bean 初始化順序問題」「資源洩漏」「循環依賴」等疑難雜症的關鍵。
+
+```
+Spring 容器啟動流程：
+
+1. 掃描 @Component/@Service/@Repository 等注解，找到所有 BeanDefinition
+2. 依照依賴順序建立 Bean 實例（調用建構子）
+3. 依賴注入（@Autowired 欄位注入 / Setter 注入）
+4. 呼叫 BeanPostProcessor.postProcessBeforeInitialization()
+5. 呼叫 @PostConstruct 方法（或 InitializingBean.afterPropertiesSet()）
+6. 呼叫 BeanPostProcessor.postProcessAfterInitialization()
+   ← AOP Proxy 就在這一步被創建！
+7. Bean 可正常使用
+   ──── 應用關閉 ────
+8. 呼叫 @PreDestroy 方法（或 DisposableBean.destroy()）
+9. Bean 被銷毀
+```
+
+### @PostConstruct 與 @PreDestroy
+
+```java
+@Service
+public class OrderCacheService {
+
+    private final Map<String, Order> cache = new ConcurrentHashMap<>();
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    // Spring 完成依賴注入後自動呼叫（建構子裡不能用 @Autowired 的欄位！）
+    @PostConstruct
+    public void init() {
+        // 這裡可以安全使用所有注入的依賴
+        log.info("預熱快取，載入最近 100 筆訂單...");
+        orderRepository.findTop100ByOrderByCreatedAtDesc()
+                       .forEach(o -> cache.put(o.getId(), o));
+    }
+
+    // 應用關閉時（JVM ShutdownHook），Spring 自動呼叫
+    @PreDestroy
+    public void destroy() {
+        log.info("清理快取...");
+        cache.clear();
+    }
+}
+```
+
+### BeanPostProcessor：攔截所有 Bean 的初始化
+
+```java
+// BeanPostProcessor 是 Spring 最強大的擴展點
+// AOP、@Autowired 注入、@Value 解析都是透過它實現的
+@Component
+public class TimingBeanPostProcessor implements BeanPostProcessor {
+
+    @Override
+    public Object postProcessBeforeInitialization(Object bean, String beanName) {
+        // 在 @PostConstruct 之前呼叫，可以修改 bean 或替換它
+        return bean; // 必須回傳 bean（或替換後的物件）
+    }
+
+    @Override
+    public Object postProcessAfterInitialization(Object bean, String beanName) {
+        // 在 @PostConstruct 之後呼叫
+        // Spring AOP 就是在這裡把原始 Bean 換成 Proxy 物件
+        if (bean instanceof OrderService) {
+            log.info("Bean [{}] 初始化完成，類型: {}", beanName, bean.getClass().getName());
+        }
+        return bean;
+    }
+}
+```
+
+### Bean Scope 與生命週期的關係
+
+```java
+@Component
+@Scope("singleton")   // 預設：整個容器只有一個實例，@PostConstruct 只執行一次
+public class SingletonService { }
+
+@Component
+@Scope("prototype")   // 每次注入都建新實例，@PostConstruct 每次都執行
+                      // ⚠️ 注意：Spring 不管理 prototype bean 的銷毀，@PreDestroy 不會呼叫！
+public class PrototypeService { }
+
+@Component
+@Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class RequestScopedService { }  // 每個 HTTP Request 一個實例
+```
+
+### 循環依賴與解決方案
+
+```
+❌ 循環依賴（Spring Boot 3.x 預設禁止）：
+   ServiceA @Autowired ServiceB
+   ServiceB @Autowired ServiceA
+   → 啟動失敗：The dependencies of some of the beans in the application context form a cycle
+
+✅ 解決方案 1（最推薦）：重新設計，提取共用邏輯到第三個 ServiceC
+✅ 解決方案 2：改用 @Lazy 延遲注入，打破循環
+   @Autowired
+   @Lazy
+   private ServiceB serviceB;
+
+✅ 解決方案 3（不推薦）：application.yml 加 spring.main.allow-circular-references=true
+   （這只是掩蓋問題，不是解決問題）
+```
+
+---
+
+## 十、@EnableAutoConfiguration 原理 <!-- 💡 進階 -->
+
+**Spring Boot 為什麼加了 `spring-boot-starter-data-jpa` 依賴就能自動配置 JPA？**
+
+```java
+@SpringBootApplication
+// ↑ 等價於：
+@SpringBootConfiguration   // = @Configuration，標記這是配置類
+@EnableAutoConfiguration   // ← 魔法在這裡！
+@ComponentScan             // 掃描當前套件及子套件
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+```
+
+### 自動配置的載入流程
+
+```
+@EnableAutoConfiguration
+    ↓
+AutoConfigurationImportSelector
+    ↓
+讀取 META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+（Spring Boot 2.x 是讀 META-INF/spring.factories，3.x 改用新路徑）
+    ↓
+找到 150+ 個 AutoConfiguration 類別（如 DataSourceAutoConfiguration）
+    ↓
+每個 AutoConfiguration 都有 @Conditional 條件過濾：
+  @ConditionalOnClass(DataSource.class)       → Classpath 有這個類才啟用
+  @ConditionalOnMissingBean(DataSource.class) → 你沒有自訂 DataSource Bean 才啟用
+  @ConditionalOnProperty("spring.datasource.url") → 有設定這個屬性才啟用
+    ↓
+符合條件的 AutoConfiguration 才真正生效 → 自動建立 Bean
+```
+
+### DataSourceAutoConfiguration 原始碼拆解
+
+```java
+@AutoConfiguration
+@ConditionalOnClass({ DataSource.class, EmbeddedDatabaseType.class })
+// ↑ Classpath 有 JDBC Driver 才啟用（引入 HikariCP starter 就有了）
+@ConditionalOnMissingBean(type = "io.r2dbc.spi.ConnectionFactory")
+@EnableConfigurationProperties(DataSourceProperties.class)
+// ↑ 把 spring.datasource.* 屬性綁定到 DataSourceProperties
+public class DataSourceAutoConfiguration {
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnMissingBean(DataSource.class)
+    // ↑ 你自己沒有定義 DataSource Bean 的時候才自動建立
+    static class PooledDataSourceConfiguration {
+        // 根據 Classpath 選擇 HikariCP/Tomcat/DBCP2
+    }
+}
+```
+
+### 如何自訂 AutoConfiguration（寫 Spring Boot Starter）
+
+```java
+// 1. 建立自動配置類
+@AutoConfiguration
+@ConditionalOnClass(RedisTemplate.class)
+@ConditionalOnProperty(prefix = "mylib.cache", name = "enabled",
+                       havingValue = "true", matchIfMissing = true)
+public class MyCacheAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean   // 讓使用者可以覆蓋
+    public CacheService cacheService(RedisTemplate<String, Object> redis) {
+        return new RedisCacheService(redis);
+    }
+}
+
+// 2. 在 META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports 中聲明
+// （這樣 Spring Boot 啟動時才會掃描到它）
+com.example.mylib.MyCacheAutoConfiguration
+```
+
+> 💡 **Debug 技巧**：啟動時加 `--debug` 參數，Spring Boot 會印出「Conditions Evaluation Report」，告訴你哪些 AutoConfiguration 生效了、哪些因為哪個條件沒通過而被跳過。
+
+---
+
 ## 本章練習題
 
 **Q1：@Service 和 @Component 在功能上有什麼差異？**

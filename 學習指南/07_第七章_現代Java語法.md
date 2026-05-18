@@ -450,6 +450,142 @@ public class OrderController {
 
 ---
 
+## 六、Java 日期時間 API（Java 8+）<!-- 💡 進階 -->
+
+Java 8 之前，`java.util.Date` 和 `Calendar` 設計混亂（月份從 0 開始！）、執行緒不安全。  
+Java 8 引入了全新的 `java.time` 套件，徹底解決這些問題。
+
+### 核心類別與選型
+
+```
+什麼時候用哪個？
+
+LocalDate          → 只有日期，無時間，無時區（生日、節假日）
+                     例：2024-01-15
+
+LocalTime          → 只有時間，無日期，無時區（每天幾點開盤）
+                     例：09:30:00
+
+LocalDateTime      → 日期 + 時間，無時區（本地時間、DB 存儲）
+                     例：2024-01-15T09:30:00
+
+ZonedDateTime      → 日期 + 時間 + 時區（跨時區系統、顯示給用戶）
+                     例：2024-01-15T09:30:00+08:00[Asia/Taipei]
+
+Instant            → Unix 毫秒時間戳（系統間傳遞時間、記錄事件順序）
+                     例：1705275000000（從 UTC 1970-01-01 開始計算）
+
+Duration           → 表示「時間長度」（兩個時刻之差）
+Period             → 表示「日期長度」（幾年幾月幾日）
+```
+
+### 常用操作
+
+```java
+// --- LocalDate 操作 ---
+LocalDate today = LocalDate.now();                     // 今天
+LocalDate birthday = LocalDate.of(1990, 3, 15);        // 指定日期
+LocalDate nextMonth = today.plusMonths(1);             // 加一個月
+LocalDate lastYear = today.minusYears(1);              // 減一年
+boolean isLeap = today.isLeapYear();                   // 是否閏年
+
+// --- LocalDateTime 操作 ---
+LocalDateTime now = LocalDateTime.now();
+LocalDateTime orderTime = LocalDateTime.of(2024, 1, 15, 9, 30, 0);
+// 格式化輸出
+String formatted = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+// 解析字串
+LocalDateTime parsed = LocalDateTime.parse("2024-01-15 09:30:00",
+    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+
+// --- ZonedDateTime 操作 ---
+ZoneId taipei = ZoneId.of("Asia/Taipei");
+ZoneId tokyo  = ZoneId.of("Asia/Tokyo");
+ZonedDateTime taipeiTime = ZonedDateTime.now(taipei);
+ZonedDateTime tokyoTime  = taipeiTime.withZoneSameInstant(tokyo);  // 轉換時區
+// 台北 09:00 → 東京 10:00（東京比台北快一小時）
+
+// --- Instant 操作 ---
+Instant now2 = Instant.now();
+long epochMilli = now2.toEpochMilli();  // 取得毫秒時間戳
+Instant fromMilli = Instant.ofEpochMilli(1705275000000L);  // 從時間戳還原
+
+// --- Duration / Period ---
+LocalDateTime start = LocalDateTime.of(2024, 1, 1, 9, 0);
+LocalDateTime end   = LocalDateTime.of(2024, 1, 1, 11, 30);
+Duration duration = Duration.between(start, end);
+long hours = duration.toHours();    // 2
+long mins  = duration.toMinutes();  // 150
+
+LocalDate from = LocalDate.of(2023, 1, 1);
+LocalDate to   = LocalDate.of(2024, 3, 15);
+Period period = Period.between(from, to);
+// period.getYears() = 1, period.getMonths() = 2, period.getDays() = 14
+```
+
+### 時區陷阱（面試常考）
+
+```java
+// ❌ 陷阱 1：LocalDateTime 沒有時區，存到 DB 可能被解讀錯
+LocalDateTime orderCreated = LocalDateTime.now();
+// 台北機器存 "2024-01-15 09:30:00"
+// 日本機器讀出來也是 "2024-01-15 09:30:00"，但實際上差了 1 小時！
+
+// ✅ 解法：跨系統傳遞時間一律用 Instant（UTC 毫秒，無歧義）
+Instant orderCreated2 = Instant.now();  // UTC 的絕對時間點
+// 或者存 ZonedDateTime，攜帶時區資訊
+
+// ❌ 陷阱 2：夏令時（Daylight Saving Time）
+// 美國/歐洲有夏令時，某些時間點不存在或重複出現
+// 2024-03-10 02:00 美東時間不存在（直接跳到 03:00）
+ZonedDateTime dst = ZonedDateTime.of(2024, 3, 10, 2, 30, 0, 0,
+    ZoneId.of("America/New_York"));
+// ZonedDateTime 會自動調整，不會報錯，但初學者可能不知道這個行為
+
+// ❌ 陷阱 3：MySQL DATETIME vs TIMESTAMP
+// DATETIME：存什麼讀什麼，無時區轉換（安全，但要自己處理時區）
+// TIMESTAMP：存時自動轉 UTC，讀時自動轉 DB 所在時區（可能造成混亂）
+// 推薦：用 DATETIME 配合應用層統一用 UTC 存儲
+```
+
+### 與舊 API 互轉
+
+```java
+// 舊 Date → 新 API
+Date oldDate = new Date();
+Instant instant       = oldDate.toInstant();
+LocalDateTime newDate = LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+
+// 新 API → 舊 Date（與舊框架整合時需要）
+LocalDateTime localDt = LocalDateTime.now();
+Date backToOld = Date.from(localDt.atZone(ZoneId.systemDefault()).toInstant());
+
+// Calendar → LocalDate
+Calendar cal = Calendar.getInstance();
+LocalDate fromCal = cal.toInstant()
+    .atZone(ZoneId.systemDefault())
+    .toLocalDate();
+```
+
+### DateTimeFormatter 格式化
+
+```java
+// 預定義格式
+DateTimeFormatter.ISO_LOCAL_DATE        // "2024-01-15"
+DateTimeFormatter.ISO_LOCAL_DATE_TIME   // "2024-01-15T09:30:00"
+
+// 自訂格式（執行緒安全！DateTimeFormatter 是 Immutable）
+DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
+String s = LocalDateTime.now().format(fmt);         // "2024/01/15 09:30"
+LocalDateTime dt = LocalDateTime.parse("2024/01/15 09:30", fmt);
+
+// ⚠️ 注意：SimpleDateFormat 不是執行緒安全的！多執行緒環境必改用 DateTimeFormatter
+// 舊寫法（危險）：static SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+// 新寫法（安全）：static DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+```
+
+---
+
 ## 本章重點整理
 
 | 特性 | 說明 | Java 版本 |
