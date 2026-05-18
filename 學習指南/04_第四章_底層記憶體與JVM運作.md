@@ -263,6 +263,80 @@ void infinite() {
 
 ---
 
+## 八、Metaspace 與類別載入機制
+
+### Metaspace：取代了 PermGen
+
+Java 8 之前有一塊叫 **PermGen（永久代）** 的記憶體，用來存放類別的 Metadata（方法名稱、字節碼等）。它有固定大小，類別載入太多就會 `OutOfMemoryError: PermGen space`。
+
+Java 8 把 PermGen 徹底廢除，改為 **Metaspace**：
+
+```
+Java 7 以前：
+  Heap = [Young Gen] + [Old Gen] + [PermGen（固定大小，預設64MB）]
+
+Java 8 以後：
+  Heap = [Young Gen] + [Old Gen]
+  + Metaspace（在 Native Memory，不受 Heap 限制，預設隨需成長）
+```
+
+| 比較 | PermGen | Metaspace |
+|------|---------|-----------|
+| 位置 | JVM Heap | Native Memory（作業系統記憶體）|
+| 大小 | 固定（預設 64MB） | 動態成長（可設上限）|
+| OOM 原因 | 類別太多或 String intern 太多 | 類別洩漏（ClassLoader 沒被回收）|
+| JVM 參數 | `-XX:MaxPermSize=256m` | `-XX:MaxMetaspaceSize=256m` |
+
+```java
+// 什麼情況會讓 Metaspace 快速增長？
+// 動態產生大量類別 —— 如 Spring 的 CGLIB Proxy、反射代理、JSP 編譯
+// 每個 Proxy 類別都會佔用 Metaspace
+```
+
+### ClassLoader：類別如何被載入到 JVM？
+
+JVM 用 **雙親委派模型（Parent Delegation Model）** 載入類別：
+
+```
+Bootstrap ClassLoader（核心，C++ 寫的）
+    載入 rt.jar / java.lang.* / java.util.* 等 JDK 核心類別
+    ↑（委派）
+Extension ClassLoader（擴充）
+    載入 jre/lib/ext/*.jar
+    ↑（委派）
+Application ClassLoader（應用程式）
+    載入你寫的程式碼和 Maven 依賴
+    ↑（委派）
+自訂 ClassLoader（如 Tomcat、Spring Boot）
+    載入 WAR 裡的 WEB-INF/classes
+```
+
+**雙親委派的運作方式：**
+
+```java
+// 當你呼叫 Class.forName("com.example.Order")
+// 1. Application ClassLoader 先問：Bootstrap，你認識這個類別嗎？
+// 2. Bootstrap 往上（自己是最頂層）→ 自己找，找不到 → 回報「不認識」
+// 3. Application ClassLoader 自己才去 classpath 找
+
+// 核心原因：防止你寫一個自己的 java.lang.String 來替換 JDK 的
+// 因為 bootstrap 永遠先被問，所以你的假 String 永遠載入不進去
+```
+
+**Spring Boot 的 fat JAR 為何需要自訂 ClassLoader？**
+
+```
+spring-boot-app.jar
+  └── BOOT-INF/lib/*.jar     ← 全部依賴打包在裡面
+  └── BOOT-INF/classes/      ← 你的程式碼
+
+問題：標準 ClassLoader 不知道怎麼從 JAR 裡的 JAR 載入類別
+解法：Spring Boot 實作了 LaunchedURLClassLoader，
+     能夠遞迴讀取嵌套的 JAR 結構
+```
+
+---
+
 ## 本章重點整理
 
 | 概念 | 說明 |

@@ -271,6 +271,185 @@ words.sort(Comparator.comparingInt(String::length));
 
 ---
 
+## 五、Java 14–21 重要新語法
+
+### Text Block（文字區塊，Java 15 正式）
+
+以前寫 JSON/SQL/HTML 要拼接很多字串，現在用三個引號包起來：
+
+```java
+// 舊寫法（充滿 \n 和 +，難以閱讀）
+String json = "{\n" +
+              "  \"name\": \"王小明\",\n" +
+              "  \"age\": 25\n" +
+              "}";
+
+// Text Block（Java 15+）
+String json = """
+        {
+          "name": "王小明",
+          "age": 25
+        }
+        """;   // 結束引號的縮排決定要去掉多少前置空白
+```
+
+### Switch Expressions（Java 14 正式）
+
+```java
+// 舊 switch：像瀑布（容易忘 break）
+String result;
+switch (day) {
+    case MONDAY: case FRIDAY: case SUNDAY:
+        result = "週末或週一"; break;
+    default:
+        result = "工作日";
+}
+
+// 新 switch expression（Java 14+）
+String result = switch (day) {
+    case MONDAY, FRIDAY, SUNDAY -> "週末或週一";
+    case TUESDAY -> "週二";
+    default -> "工作日";
+};
+
+// 配合 yield 回傳值（複雜邏輯）
+int fee = switch (memberLevel) {
+    case GOLD -> 0;
+    case SILVER -> {
+        int discount = calculateDiscount();
+        yield 100 - discount;   // yield 代替 return
+    }
+    default -> 100;
+};
+```
+
+### Records（Java 16 正式）
+
+以前寫一個純資料類別（DTO）要寫一堆 getter/setter/equals/hashCode/toString：
+
+```java
+// 舊做法：十幾行樣板程式碼
+public class OrderDTO {
+    private final String orderId;
+    private final double amount;
+    public OrderDTO(String orderId, double amount) { ... }
+    public String getOrderId() { return orderId; }
+    public double getAmount() { return amount; }
+    // equals, hashCode, toString...
+}
+
+// Record（Java 16+）：一行搞定
+public record OrderDTO(String orderId, double amount) {}
+// 自動生成：建構子、getters（orderId()、amount()）、equals、hashCode、toString
+
+// 使用
+OrderDTO dto = new OrderDTO("ORD-001", 999.0);
+System.out.println(dto.orderId());    // ORD-001
+System.out.println(dto);             // OrderDTO[orderId=ORD-001, amount=999.0]
+
+// Record 是 final 的（不可繼承），欄位是 final 的（不可修改）
+// 適合：DTO、Value Object、API 回應類別
+```
+
+### Pattern Matching for instanceof（Java 16 正式）
+
+```java
+// 舊寫法：先判斷再強轉（重複說兩次類型）
+if (obj instanceof String) {
+    String s = (String) obj;  // 多餘的強轉
+    System.out.println(s.length());
+}
+
+// 新寫法（Java 16+）：判斷和轉型合為一步
+if (obj instanceof String s) {
+    System.out.println(s.length());  // s 直接可用
+}
+
+// 配合 switch（Java 21 正式的 Pattern Matching for switch）
+Object shape = getShape();
+String desc = switch (shape) {
+    case Circle c -> "半徑 " + c.radius();
+    case Rectangle r -> "寬 " + r.width() + " 高 " + r.height();
+    case null -> "空";
+    default -> "未知形狀";
+};
+```
+
+### Sealed Classes（Java 17 正式）
+
+限制哪些類別可以繼承，讓繼承關係可預測、可窮舉：
+
+```java
+// 宣告：Shape 只能被 Circle、Rectangle、Triangle 繼承
+public sealed interface Shape permits Circle, Rectangle, Triangle {}
+
+public record Circle(double radius) implements Shape {}
+public record Rectangle(double width, double height) implements Shape {}
+public record Triangle(double base, double height) implements Shape {}
+
+// 好處：switch 可以窮舉，不需要 default
+double area = switch (shape) {
+    case Circle c -> Math.PI * c.radius() * c.radius();
+    case Rectangle r -> r.width() * r.height();
+    case Triangle t -> 0.5 * t.base() * t.height();
+    // 不需要 default：編譯器知道 Shape 只有這三種
+};
+```
+
+### Virtual Threads（虛擬執行緒，Java 21 正式）<!-- 🔴 資深 -->
+
+這是 Java 21 最重要的特性，顛覆了「要高並發就要用 WebFlux」的認知。
+
+```
+傳統平台執行緒（Platform Thread）：
+  每個 Thread 對應一個 OS Thread
+  每個 OS Thread 佔 ~1MB Stack 記憶體
+  100 萬請求 = 100 萬 OS Thread = 1TB 記憶體（不可能）
+
+虛擬執行緒（Virtual Thread）：
+  由 JVM 管理，不直接對應 OS Thread
+  每個虛擬執行緒只佔幾 KB
+  100 萬個虛擬執行緒完全可行！
+  阻塞時 JVM 自動把 OS Thread 讓出給其他虛擬執行緒
+```
+
+```java
+// 建立虛擬執行緒（極其簡單）
+Thread vThread = Thread.ofVirtual().start(() -> {
+    // 這裡的阻塞（JDBC、HTTP 呼叫）不會真正阻塞 OS Thread
+    var result = database.query("SELECT ...");
+    System.out.println(result);
+});
+
+// Spring Boot 3.2+ 開啟虛擬執行緒（一行設定）
+// application.yml：
+// spring.threads.virtual.enabled: true
+// 效果：所有 HTTP 請求處理改用虛擬執行緒，不再需要 WebFlux！
+
+// 傳統寫法（阻塞 JDBC），配上虛擬執行緒，就能達到 WebFlux 的高並發
+@RestController
+public class OrderController {
+    // 虛擬執行緒開啟後，即使這裡阻塞，也不會浪費 OS Thread
+    @GetMapping("/orders/{id}")
+    public Order getOrder(@PathVariable Long id) {
+        return orderRepository.findById(id).orElseThrow(); // 阻塞 OK！
+    }
+}
+```
+
+**虛擬執行緒 vs WebFlux 選型（Java 21 時代）：**
+
+| | 虛擬執行緒 | WebFlux |
+|---|---|---|
+| 程式碼風格 | 傳統同步（易學易懂）| 響應式（學習曲線高）|
+| 效能上限 | 高（對 I/O 密集場景）| 更高（CPU 密集也優化）|
+| 適合場景 | 大部分 Web 服務 | 需要背壓控制的 Streaming |
+| Spring Boot | 3.2+ 一行開啟 | 需要換 webflux 依賴 |
+
+> 💡 建議：新專案優先考慮虛擬執行緒（簡單），只有確定需要背壓/SSE 才用 WebFlux。
+
+---
+
 ## 本章重點整理
 
 | 特性 | 說明 | Java 版本 |

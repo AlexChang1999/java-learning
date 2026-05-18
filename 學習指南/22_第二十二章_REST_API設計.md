@@ -315,7 +315,116 @@ public ResponseEntity<OrderResponse> create(@RequestBody @Valid OrderRequest req
 
 ---
 
-## 七、API 設計清單（上線前自我檢查）
+## 七、Swagger / OpenAPI：讓 API 自己說話
+
+寫完 API 還需要手動維護一份 Word 文件告訴前端「這個端點要傳什麼」——這是很多團隊的痛苦。**Swagger UI** 讓你的程式碼自動生成互動式 API 文件，前端可以直接在瀏覽器裡試打 API。
+
+```xml
+<!-- pom.xml：加入 springdoc-openapi（比 springfox 更現代，支援 Spring Boot 3）-->
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>2.3.0</version>
+</dependency>
+```
+
+```yaml
+# application.yml
+springdoc:
+  api-docs:
+    path: /api-docs          # JSON 格式的 API spec
+  swagger-ui:
+    path: /swagger-ui.html   # Swagger UI 介面
+    operations-sorter: method
+```
+
+加完依賴後直接啟動，打開 `http://localhost:8080/swagger-ui.html` 就能看到所有 API。
+
+**用注解增加說明：**
+
+```java
+import io.swagger.v3.oas.annotations.*;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+
+@Tag(name = "訂單管理", description = "建立、查詢、取消訂單")  // API 分組
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Operation(
+        summary = "建立訂單",
+        description = "提交一個新的限價單或市價單，若庫存充足立即撮合"
+    )
+    @ApiResponse(responseCode = "201", description = "訂單建立成功")
+    @ApiResponse(responseCode = "400", description = "請求格式錯誤")
+    @ApiResponse(responseCode = "401", description = "未登入")
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    public OrderDTO createOrder(
+        @io.swagger.v3.oas.annotations.parameters.RequestBody(
+            description = "訂單內容，side 只能是 BUY 或 SELL"
+        )
+        @RequestBody @Valid CreateOrderRequest request
+    ) {
+        return orderService.createOrder(request);
+    }
+
+    @Operation(summary = "查詢訂單", description = "根據訂單 ID 查詢單一訂單")
+    @Parameter(name = "id", description = "訂單的唯一 ID", example = "ORD-20240115-001")
+    @GetMapping("/{id}")
+    public OrderDTO getOrder(@PathVariable String id) {
+        return orderService.findById(id);
+    }
+}
+```
+
+**在 DTO 上增加欄位說明：**
+
+```java
+public class CreateOrderRequest {
+
+    @Schema(description = "商品 ID", example = "PRD-001", requiredMode = Schema.RequiredMode.REQUIRED)
+    @NotBlank
+    private String productId;
+
+    @Schema(description = "購買數量，必須大於 0", example = "2", minimum = "1")
+    @Min(1)
+    private int quantity;
+
+    @Schema(description = "下單方向", allowableValues = {"BUY", "SELL"})
+    private String side;
+}
+```
+
+**Security 設定：讓 Swagger 能帶 JWT Token：**
+
+```java
+@Configuration
+public class SwaggerConfig {
+    @Bean
+    public OpenAPI openAPI() {
+        return new OpenAPI()
+            .info(new Info()
+                .title("撮合引擎 API")
+                .version("1.0.0")
+                .description("提供訂單管理、市場行情查詢功能"))
+            .addSecurityItem(new SecurityRequirement().addList("bearerAuth"))
+            .components(new Components()
+                .addSecuritySchemes("bearerAuth",
+                    new SecurityScheme()
+                        .type(SecurityScheme.Type.HTTP)
+                        .scheme("bearer")
+                        .bearerFormat("JWT")));
+    }
+}
+```
+
+設定完後，Swagger UI 右上角會出現「Authorize」按鈕，貼入 JWT Token 後就能在 UI 裡直接測試需要認證的 API。
+
+---
+
+## 八、API 設計清單（上線前自我檢查）
 
 ```
 URL 設計：

@@ -907,6 +907,96 @@ spring:
 
 ---
 
+## 九、Lazy Loading 的經典陷阱：LazyInitializationException <!-- 💡 進階 -->
+
+這是 JPA 新手最常遇到的錯誤之一，理解它需要先知道 Hibernate Session 的生命週期。
+
+### 問題重現
+
+```java
+@Entity
+public class Order {
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY)  // 預設 LAZY
+    private List<OrderItem> items;
+}
+
+// Service 層
+@Service
+public class OrderService {
+
+    @Transactional
+    public Order getOrder(Long id) {
+        return orderRepository.findById(id).orElseThrow();
+        // 這裡 Transaction 結束，Hibernate Session 關閉
+    }
+}
+
+// Controller 層（Transaction 已結束）
+@GetMapping("/orders/{id}")
+public OrderDTO getOrder(@PathVariable Long id) {
+    Order order = orderService.getOrder(id);
+    // ❌ 觸發 LazyInitializationException！
+    // Hibernate Session 已關閉，無法再去 DB 查 items
+    order.getItems().size();
+}
+```
+
+```
+錯誤訊息：
+org.hibernate.LazyInitializationException: failed to lazily initialize a collection,
+could not initialize proxy - no Session
+```
+
+### 根本原因
+
+```
+Hibernate 的 Lazy Loading 依賴 Session（資料庫連線）。
+Session 在 @Transactional 方法結束時自動關閉。
+在 Transaction 外部存取 Lazy 屬性 → Session 已關閉 → 爆炸。
+```
+
+### 解法一：在 Transaction 內完成所有存取（推薦）
+
+```java
+@Service
+public class OrderService {
+
+    @Transactional  // Transaction 在這個方法內
+    public OrderDTO getOrderWithItems(Long id) {
+        Order order = orderRepository.findById(id).orElseThrow();
+        // 在 Transaction 內觸發 Lazy Loading（此時 Session 還開著）
+        order.getItems().size();  // 這裡會去 DB 查
+        return OrderDTO.from(order);  // 轉換成 DTO，之後不再需要 Session
+    }
+    // Transaction 在這裡結束，但 DTO 不依賴 Session 所以沒問題
+}
+```
+
+### 解法二：JOIN FETCH / @EntityGraph（一次查詢取所有資料）
+
+```java
+// 用 JOIN FETCH 一次 SQL 取出 order + items
+@Query("SELECT o FROM Order o JOIN FETCH o.items WHERE o.id = :id")
+Optional<Order> findByIdWithItems(@Param("id") Long id);
+
+// 或用 @EntityGraph
+@EntityGraph(attributePaths = {"items"})
+Optional<Order> findById(Long id);
+```
+
+### 解法三：Open Session in View（不推薦，但常見）
+
+```yaml
+# application.yml
+spring:
+  jpa:
+    open-in-view: true  # 預設 true！讓 Session 延長到 HTTP Response 結束
+```
+
+> ⚠️ `open-in-view: true` 是個反模式！Session 延長到 View 層，佔用資料庫連線過久，高並發下會耗盡連線池。強烈建議設為 `false`，改用解法一或二。
+
+---
+
 ## 練習題
 
 ### 練習一：設計 Account 實體
