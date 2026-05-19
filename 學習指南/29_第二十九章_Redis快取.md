@@ -1214,6 +1214,215 @@ redis-cli info keyspace
 
 ---
 
+## 十三、Redis Stream：輕量級消息佇列 <!-- 💡 進階 -->
+
+Redis Stream 是 Redis 5.0 加入的資料結構，專門設計來做「消息佇列」，  
+彌補了 Pub/Sub「消息不持久、無法回放」的缺點。
+
+### Redis Stream vs Kafka vs Pub/Sub
+
+| 維度 | Redis Pub/Sub | Redis Stream | Kafka |
+|------|--------------|--------------|-------|
+| **持久化** | ❌ 無（訂閱者下線就丟失）| ✅ 持久（存在記憶體/RDB/AOF）| ✅ 持久（磁碟）|
+| **消費者組** | ❌ 無 | ✅ 支援 | ✅ 支援 |
+| **消息回放** | ❌ 不支援 | ✅ 支援（從任意 ID 讀取）| ✅ 支援 |
+| **擴展性** | 單機 | 單機（Cluster 分片）| 分散式（多 Broker）|
+| **訊息量** | 低 | 中（億級以內）| 高（兆級）|
+| **延遲** | < 1ms | < 1ms | 5~10ms |
+| **適合場景** | 即時廣播（不需要可靠）| 輕量審計日誌、IoT | 核心業務事件、高吞吐 |
+
+### Stream 核心命令
+
+```bash
+# XADD：向 Stream 追加消息
+# * = 讓 Redis 自動生成 ID（格式：毫秒時間戳-序號）
+XADD order-events * action "order_created" orderId "O001" amount "1000"
+# 返回：1705275000000-0（消息 ID = 時間戳-序號）
+
+# 也可以指定 ID（用於資料遷移或冪等寫入）
+XADD order-events 1705275000000-1 action "order_paid" orderId "O001"
+
+# 限制 Stream 長度（防止記憶體無限增長）
+XADD order-events MAXLEN ~ 10000 * action "order_shipped" orderId "O001"
+# ~ 表示近似截斷（效能更好，可能保留略多於 10000 條）
+
+# XREAD：讀取消息（不刪除，可多次讀取）
+XREAD COUNT 10 STREAMS order-events 0           # 從頭讀 10 條
+XREAD COUNT 10 STREAMS order-events 1705275000000-0  # 從某個 ID 之後讀
+XREAD COUNT 10 BLOCK 0 STREAMS order-events $   # 阻塞等待新消息（$ = 只讀新增的）
+
+# XLEN：查看 Stream 長度
+XLEN order-events
+
+# XRANGE：查詢範圍內的消息
+XRANGE order-events - +              # 所有消息
+XRANGE order-events - + COUNT 100   # 前 100 條
+XRANGE order-events 1705275000000-0 1705275999999-999  # 時間範圍
+```
+
+### Consumer Group（消費者組）
+
+```bash
+# 建立消費者組（$ = 從現在起的新消息，0 = 從頭開始）
+XGROUP CREATE order-events inventory-service $ MKSTREAM
+XGROUP CREATE order-events notification-service $
+
+# XREADGROUP：以消費者組的方式讀取（消息被「分配」給這個消費者）
+XREADGROUP GROUP inventory-service consumer-1 COUNT 10 STREAMS order-events >
+# > 表示讀取「尚未分配給任何消費者」的新消息
+
+# 處理完後必須 ACK（確認），否則消息會停留在 Pending 狀態
+XACK order-events inventory-service 1705275000000-0
+
+# 查看 Pending 消息（已分配但未 ACK 的）
+XPENDING order-events inventory-service - + 10
+
+# 重新認領超時的 Pending 消息（宕機重啟後救援）
+XCLAIM order-events inventory-service consumer-2 60000 1705275000000-0
+# 把超過 60 秒未 ACK 的消息重新分配給 consumer-2
+```
+
+### Spring Boot 整合 Redis Stream
+
+```java
+// 發布消息到 Stream
+@Service
+public class OrderEventPublisher {
+
+    private final StringRedisTemplate redisTemplate;
+    private static final String STREAM_KEY = "order-events";
+
+    public void publish(String orderId, String action, BigDecimal amount) {
+        Map<String, String> fields = Map.of(
+            "action",  action,
+            "orderId", orderId,
+            "amount",  amount.toPlainString(),
+            "ts",      String.valueOf(System.currentTimeMillis())
+        );
+
+        // RecordId.autoGenerate() = 讓 Redis 自動生成 ID
+        StreamRecords.newRecord()
+            .in(STREAM_KEY)
+            .ofStrings(fields)
+            .withId(RecordId.autoGenerate());
+
+        redisTemplate.opsForStream().add(
+            MapRecord.create(STREAM_KEY, fields)
+        );
+    }
+}
+
+// 消費者配置
+@Configuration
+@EnableRedisStreams
+public class RedisStreamConfig {
+
+    @Bean
+    public StreamMessageListenerContainer<String, MapRecord<String, String, String>>
+            streamListenerContainer(RedisConnectionFactory factory) {
+
+        StreamMessageListenerContainer.StreamMessageListenerContainerOptions<String,
+                MapRecord<String, String, String>> options =
+            StreamMessageListenerContainer.StreamMessageListenerContainerOptions
+                .builder()
+                .pollTimeout(Duration.ofMillis(100))    // 輪詢間隔
+                .build();
+
+        return StreamMessageListenerContainer.create(factory, options);
+    }
+
+    @Bean
+    public Subscription orderEventSubscription(
+            StreamMessageListenerContainer<String, MapRecord<String, String, String>> container,
+            OrderEventConsumer consumer,
+            StringRedisTemplate redisTemplate) {
+
+        // 確保消費者組存在
+        try {
+            redisTemplate.opsForStream().createGroup("order-events", "inventory-service");
+        } catch (RedisSystemException e) {
+            // 消費者組已存在，忽略
+        }
+
+        return container.receive(
+            Consumer.from("inventory-service", "consumer-1"),
+            StreamOffset.create("order-events", ReadOffset.lastConsumed()),
+            consumer
+        );
+    }
+}
+
+// 消費者實作
+@Component
+public class OrderEventConsumer
+        implements StreamListener<String, MapRecord<String, String, String>> {
+
+    private final StringRedisTemplate redisTemplate;
+    private final InventoryService inventoryService;
+
+    @Override
+    public void onMessage(MapRecord<String, String, String> record) {
+        Map<String, String> fields = record.getValue();
+        String action  = fields.get("action");
+        String orderId = fields.get("orderId");
+
+        try {
+            if ("order_created".equals(action)) {
+                inventoryService.reserveStock(orderId);
+            }
+            // 處理成功：ACK
+            redisTemplate.opsForStream().acknowledge(
+                "order-events", "inventory-service", record.getId()
+            );
+        } catch (Exception e) {
+            log.error("處理消息失敗，將在 Pending 中等待重試: {}", record.getId(), e);
+            // 不 ACK → 消息留在 Pending 狀態 → 可被 XCLAIM 重新認領
+        }
+    }
+}
+```
+
+### Pending 消息補償（防止消息丟失）
+
+```java
+// 定時任務：處理長時間未 ACK 的 Pending 消息
+@Scheduled(fixedDelay = 60000)   // 每分鐘執行
+public void claimStaleMessages() {
+    // 查詢超過 5 分鐘未 ACK 的 Pending 消息
+    PendingMessagesSummary summary = redisTemplate.opsForStream()
+        .pending("order-events", "inventory-service");
+
+    if (summary.getTotalPendingMessages() > 0) {
+        // 重新認領並處理
+        List<MapRecord<String, String, String>> staleMessages =
+            redisTemplate.opsForStream().claim(
+                "order-events", "inventory-service", "consumer-recovery",
+                Duration.ofMinutes(5),
+                summary.minMessageId(), summary.maxMessageId()
+            );
+
+        staleMessages.forEach(this::processAndAck);
+    }
+}
+```
+
+### 適合用 Redis Stream 的場景
+
+```
+✅ 適合：
+  - 審計日誌（用戶操作記錄，需要持久化但量不超過億級）
+  - IoT 輕量數據收集（感測器每秒數百條，消費後存入 ClickHouse）
+  - 服務內部的異步任務佇列（發送 Email、生成報告）
+  - 開發/測試環境（Kafka 太重了）
+
+❌ 不適合：
+  - 超高吞吐（千萬 TPS）→ 用 Kafka
+  - 需要跨服務、多訂閱者的核心業務事件 → 用 Kafka
+  - 需要長期保存（幾個月/幾年）的歷史記錄 → 用 Kafka（磁碟）
+```
+
+---
+
 ## 練習題
 
 <details>
