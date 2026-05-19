@@ -1098,3 +1098,9 @@ At-Least-Once 的工作流程是：Consumer 處理完訊息 → 提交 Offset。
 **結論**：At-Least-Once + 冪等設計是業界最常見的選擇，效能好、實作相對簡單，且能真正解決端到端的重複問題。Exactly-Once 適合 Kafka Streams 這類純 Kafka 內部計算的場景。
 
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 35 章 | Phase 5：進階後端技術
+> 下一章（第 36 章）：[第三十一章：WebSocket 即時通訊](31_第三十一章_WebSocket即時通訊.md)

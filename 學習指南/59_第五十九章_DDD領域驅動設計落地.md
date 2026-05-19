@@ -397,3 +397,9 @@ Aggregate 是一致性邊界：修改 Aggregate 內部的任何東西，整個 A
 <summary>答案</summary>
 Application Service（應用服務）是「用例協調者」，負責編排流程：從 Repository 取 Aggregate、呼叫 Domain 的方法、儲存、發送事件。它不含業務邏輯，換一個用例框架（從 REST 換成 gRPC）應該只需改 Application Service 的輸入輸出，不改業務邏輯。Domain Service（領域服務）含有業務邏輯，但這個邏輯不屬於任何單一 Aggregate（例如「轉帳」需要同時操作兩個 Account Aggregate，這個操作本身就是 Domain Service 的範疇）。簡單記：有「if 業務規則」的邏輯 = Domain；有「取 A、呼叫 B、存 C、發 D」的流程編排 = Application。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 56 章 | Phase 9：微服務與分散式架構
+> 下一章（第 57 章）：[第五十五章：gRPC 深入實作](55_第五十五章_gRPC深入實作.md)

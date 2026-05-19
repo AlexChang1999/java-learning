@@ -1267,3 +1267,9 @@ JVM 啟動參數為：
 - 使用 `MaxRAMPercentage` 保留緩衝空間，就能避免這個問題
 
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 41 章 | Phase 6：容器化與 DevOps
+> 下一章（第 42 章）：[第三十四章：CI/CD 與 GitHub Actions](34_第三十四章_CICD與GitHub_Actions.md)

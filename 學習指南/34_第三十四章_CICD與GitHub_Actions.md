@@ -1195,3 +1195,9 @@ on:
 與第十六章的連結：**沒有測試，CI 只是「自動確認能編譯」而已。**
 先把撮合引擎的 `OrderBook`、`MatchingEngine` 等核心邏輯寫好 JUnit 測試，
 讓 CI 幫你守門，才能在快速迭代的同時確保系統不崩壞。
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 42 章 | Phase 6：容器化與 DevOps
+> 下一章（第 43 章）：[第四十七章：Kubernetes 深入實戰](47_第四十七章_Kubernetes深入實戰.md)

@@ -384,3 +384,9 @@ public final class OrderService { ... }   // ❌ Spring AOP 無法代理
 <summary>答案</summary>
 預設順序是不確定的。可以用 @Order 注解指定優先順序（數字越小越先執行外層）。類比洋蔥模型：@Order(1) 的 Aspect 是最外層，先執行 Before，最後執行 After；@Order(2) 的 Aspect 在內層。例如：外層做日誌，內層做事務，確保日誌能記錄到事務的完整結果。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 16 章 | Phase 3：工程基礎
+> 下一章（第 17 章）：[第十六章：測試驅動開發](16_第十六章_測試驅動開發.md)

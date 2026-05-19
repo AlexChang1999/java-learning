@@ -352,3 +352,9 @@ ClickHouse 每次 INSERT 都會建立一個新的「Part」（資料塊）。如
 <summary>答案</summary>
 適合 ClickHouse。原因：(1) 需要掃描所有用戶最近 30 天的訂單（可能幾億行），這是典型 OLAP 查詢，不是點查；(2) 需要 GROUP BY user_id, category 做聚合計算；(3) 這個查詢和線上下單業務完全分離，不需要強一致性。架構方案：用 CDC（Debezium）把 MySQL 的訂單數據準即時同步到 ClickHouse，再在 ClickHouse 上跑分析查詢。可以建立物化視圖預先計算每日每用戶的商品類別偏好，讓查詢從幾秒降到毫秒級。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 38 章 | Phase 5：進階後端技術
+> 下一章（第 39 章）：[第六十五章：時序數據庫](65_第六十五章_時序數據庫.md)

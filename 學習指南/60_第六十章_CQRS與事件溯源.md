@@ -347,3 +347,9 @@ Client
 <summary>答案</summary>
 不要一次全部重寫（大爆炸風險極高）。遷移策略：Step 1 — 分離讀寫介面，在現有 Service 層引入 CommandService 和 QueryService，還是操作同一個資料庫，但邏輯開始分離。Step 2 — 建立 Read Model，在現有 DB 旁邊建一個用於查詢的視圖/快取（可以用 Redis 或額外的 Table），從現有 DB 同步數據，讓查詢走 Read Model。Step 3 — 逐步引入事件，讓寫側在儲存後發布事件，讀側訂閱事件更新 Read Model，逐步解耦。每一步都可以上線驗證，避免整個系統不可用的風險。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 60 章 | Phase 9：微服務與分散式架構
+> 下一章（第 61 章）：[第四十二章：高可用與熔斷降級](42_第四十二章_高可用與熔斷降級.md)

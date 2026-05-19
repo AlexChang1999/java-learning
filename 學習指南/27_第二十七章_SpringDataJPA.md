@@ -1195,3 +1195,9 @@ public class AuditService {
 | N+1 | 查 N 筆主表 + N 次子表 = 慢 | 用 JOIN FETCH 合並成一條 |
 | @Transactional | 方法是一個原子操作 | 撮合一次成交 = 一個交易 |
 | @Version | 版本號防並發衝突 | 高頻更新訂單時防重複 |
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 24 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 25 章）：[第五十四章：資料庫 Migration（Flyway）](54_第五十四章_資料庫Migration與版本管理.md)

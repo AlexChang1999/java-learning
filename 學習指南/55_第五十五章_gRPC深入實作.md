@@ -355,3 +355,9 @@ BlockingStub（同步阻塞）：等待 Server 回應再繼續，程式碼簡單
 <summary>答案</summary>
 在 Client 端的 gRPC 攔截器裡加入路由邏輯：讀取當前用戶的 feature flag（或按 userId 雜湊），決定呼叫哪個 Server address。或者在 API Gateway 層（如 Istio/Envoy）設定流量分割規則，不需要修改應用程式碼。Istio 支援對 HTTP/2 流量（包括 gRPC）設定 VirtualService 的 weight（權重），10% 路由到 v2，90% 路由到 v1。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 57 章 | Phase 9：微服務與分散式架構
+> 下一章（第 58 章）：[第四十一章：分散式系統設計原則](41_第四十一章_分散式系統設計原則.md)

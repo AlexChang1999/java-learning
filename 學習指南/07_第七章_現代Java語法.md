@@ -638,3 +638,9 @@ String result = opt.get();
 <summary>答案</summary>
 `Optional.of(null)` 會立刻拋出 NullPointerException。應改為 `Optional.ofNullable(null)`。另外，`opt.get()` 在 Optional 為空時也會拋出例外，應改用 `orElse()` 或 `orElseThrow()`。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 3 章 | Phase 1：Java 語言核心
+> 下一章（第 4 章）：[第十七章：泛型深入](17_第十七章_泛型深入.md)

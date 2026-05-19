@@ -380,3 +380,9 @@ GitFlow 的哲學是「隔離」：每個功能在自己的分支裡開發完再
 <summary>答案</summary>
 順序很重要，一定要先做第 1 步：Step 1（最緊急！）立刻 rotate（撤銷並重新生成）那個 API 金鑰，讓舊金鑰失效。GitHub 爬蟲在幾分鐘內就會掃到，攻擊者可能已經看到了，所以「把歷史清乾淨」救不了已經洩漏的金鑰。Step 2 從 Git 歷史刪除：用 git filter-repo（不是過時的 filter-branch）把含有金鑰的檔案從所有 commit 裡刪除，然後 force push。Step 3 通知所有 clone 了這個 repo 的人，讓他們重新 clone（他們本地還有舊歷史）。Step 4 檢查是否有異常使用記錄（雲平台的 API usage 日誌）。Step 5 加入 .gitignore，防止再次發生；考慮使用 git-secrets 或 truffleHog 掃描。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 19 章 | Phase 3：工程基礎
+> 下一章（第 20 章）：[第三章：檔案 IO 與網路程式設計](03_第三章_檔案IO與網路程式設計.md)

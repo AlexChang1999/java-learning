@@ -494,3 +494,9 @@ GET /api/v1/orderbook/TSLA?depth=5
 
 設計理由：用 GET（只讀），symbol 放 path variable（它是資源識別符），depth 放 query parameter（它是修飾符，不是識別符）。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 26 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 27 章）：[第六十九章：GraphQL API 設計](69_第六十九章_GraphQL_API設計.md)

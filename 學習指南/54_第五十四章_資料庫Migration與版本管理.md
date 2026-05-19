@@ -280,3 +280,9 @@ databaseChangeLog:
 <summary>答案</summary>
 使用 baseline 機制：設定 `spring.flyway.baseline-on-migrate=true` 和 `spring.flyway.baseline-version=1`。Flyway 會把當前狀態標記為 V1（baseline），之後只執行 V2 以上的腳本，不會嘗試重新建立已存在的 Table。最佳做法是先寫一個 V1__baseline.sql 描述現有的完整 Schema（用 `mysqldump --no-data` 匯出），讓新環境可以從零建立完整的 Schema。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 25 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 26 章）：[第二十二章：REST API 設計](22_第二十二章_REST_API設計.md)

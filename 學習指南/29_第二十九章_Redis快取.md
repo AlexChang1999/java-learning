@@ -1496,3 +1496,9 @@ ZREVRANGE orderbook:BTC:buy 0 4 WITHSCORES
 ---
 
 > **本章總結**：Redis 的核心價值在於把資料存在 RAM（~0.1 ms）而非磁碟（~1~10 ms）。ZSet 的跳表結構讓它天然適合撮合引擎的訂單簿場景——依價格排序、O(log n) 查找最佳價位。它的單執行緒 + epoll 設計和 LMAX Disruptor 有共同的哲學：**消滅鎖競爭，讓每個操作足夠快，比多執行緒競爭更高效**。
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 32 章 | Phase 5：進階後端技術
+> 下一章（第 33 章）：[第四十八章：MongoDB 與 NoSQL 設計](48_第四十八章_MongoDB與NoSQL設計.md)

@@ -1148,3 +1148,9 @@ JVM 本身 + Metaspace + OS：約 1 GB
 - STOMP 1.2 規範：https://stomp.github.io/stomp-specification-1.2.html
 - Spring 官方文件：[WebSockets](https://docs.spring.io/spring-framework/docs/current/reference/html/web.html#websocket)
 - 下一章預告：**第三十二章 — 訊息佇列與 Kafka**（解決多台 WebSocket 伺服器之間的訊息同步問題）
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 36 章 | Phase 5：進階後端技術
+> 下一章（第 37 章）：[第五十三章：Elasticsearch 搜尋引擎](53_第五十三章_Elasticsearch搜尋引擎.md)

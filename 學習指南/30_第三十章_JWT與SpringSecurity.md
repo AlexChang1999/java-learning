@@ -1159,3 +1159,9 @@ public ResponseEntity<?> createOrder(
 ```
 
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 28 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 29 章）：[第二十章：日誌框架](20_第二十章_日誌框架.md)

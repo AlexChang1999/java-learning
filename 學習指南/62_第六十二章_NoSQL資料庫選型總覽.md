@@ -293,3 +293,9 @@ MySQL 的設計流程是：先把業務實體正規化（User 表、Order 表、
 <summary>答案</summary>
 OLTP（Online Transaction Processing）：每次處理少量行，高並發讀寫，需要事務保證（下一筆訂單、扣一次庫存）。OLAP（Online Analytical Processing）：每次掃描大量行，但只讀取少數幾列（「統計所有訂單的總金額按月份分組」）。行存儲（OLTP）的問題：聚合查詢要讀整行再過濾列，IO 浪費大。列存儲（OLAP）的優勢：只讀需要的列，壓縮率高，向量化 SIMD 批次計算，同一查詢可以快 10-100 倍。為什麼要分開：如果直接在 MySQL 上跑複雜 OLAP 查詢，會鎖表影響線上業務（OLTP）。通常用 ETL 或 CDC（如 Debezium）把 OLTP 資料同步到 OLAP 庫做分析，兩者完全隔離。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 31 章 | Phase 5：進階後端技術
+> 下一章（第 32 章）：[第二十九章：Redis 快取](29_第二十九章_Redis快取.md)

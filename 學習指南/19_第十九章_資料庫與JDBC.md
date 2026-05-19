@@ -379,3 +379,9 @@ Connection、Statement、ResultSet 都是需要手動關閉的資源。如果不
 <summary>答案</summary>
 N+1 問題：先用 1 次查詢取得 N 個訂單，然後對每個訂單再執行 1 次查詢取得成交記錄，總共 N+1 次資料庫查詢。例如：查出 100 筆訂單，再分別查每筆訂單的成交記錄 = 101 次查詢。解法：用 JOIN 一次查詢取得所有需要的資料，或用 IN 子句批次查詢，例如 SELECT * FROM trades WHERE buy_order_id IN ('O1','O2',...,'O100')。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 22 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 23 章）：[第二十一章：Spring Boot 基礎](21_第二十一章_SpringBoot基礎.md)

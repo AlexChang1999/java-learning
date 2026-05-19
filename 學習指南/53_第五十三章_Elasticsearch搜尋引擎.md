@@ -381,3 +381,9 @@ Text 型別在建立索引時會先分詞（如「Java 程式設計」→ ["Java
 <summary>答案</summary>
 ES 不是為 ACID 事務設計的，不保證強一致性（預設 near-real-time，寫入後約 1 秒才可搜尋）。ES 不支援 JOIN、外鍵、複雜事務。主要適合：全文搜尋、日誌分析、時序資料、聚合統計。主資料（訂單、帳戶、庫存）應存在 MySQL/PostgreSQL，ES 只是搜尋索引。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 37 章 | Phase 5：進階後端技術
+> 下一章（第 38 章）：[第六十四章：ClickHouse 與 OLAP 分析資料庫](64_第六十四章_ClickHouse與OLAP分析資料庫.md)

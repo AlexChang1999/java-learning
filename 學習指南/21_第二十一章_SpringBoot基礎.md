@@ -779,3 +779,9 @@ com.example.mylib.MyCacheAutoConfiguration
 <summary>答案</summary>
 欄位注入：@Autowired private TradeReporter reporter; — 簡潔但有問題：欄位是 private，單元測試難以注入 Mock 物件；依賴不明確，你無法一眼看出這個類別需要什麼；不能宣告為 final（依賴可以被修改）。建構子注入：在建構子參數中宣告依賴，Spring 自動注入。優點：可以宣告 final（不可變）；測試時直接 new MyService(mockReporter) 即可，不需要 Spring Context；依賴關係清晰可見；如果依賴缺失，啟動時立即報錯（而非執行到某個方法才 NullPointerException）。Spring 官方和業界最佳實踐都推薦建構子注入。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 23 章 | Phase 4：資料庫 + Spring 後端
+> 下一章（第 24 章）：[第二十七章：Spring Data JPA](27_第二十七章_SpringDataJPA.md)

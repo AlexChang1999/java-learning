@@ -347,3 +347,9 @@ CREATE TABLE orders_by_rider (
 
 兩張表都存了 order_id，應用層在建立訂單時同時寫入兩張表（可用 BATCH 保證原子性）。
 </details>
+
+---
+
+<!-- NAV_FOOTER_START -->
+> 學習順序第 34 章 | Phase 5：進階後端技術
+> 下一章（第 35 章）：[第二十八章：Kafka 訊息佇列](28_第二十八章_Kafka訊息佇列.md)
